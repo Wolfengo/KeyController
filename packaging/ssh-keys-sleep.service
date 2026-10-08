@@ -1,0 +1,34 @@
+[Unit]
+Description=Prepare KeyController managed SSH agents before system sleep
+Before=sleep.target
+StopWhenUnneeded=yes
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/lib/ssh-keys/sleep-coordinator prepare
+ExecStop=/usr/lib/ssh-keys/sleep-coordinator resume
+TimeoutStartSec=20s
+TimeoutStopSec=20s
+KillMode=control-group
+RuntimeDirectory=ssh-keys-sleep
+RuntimeDirectoryMode=0700
+RuntimeDirectoryPreserve=yes
+UMask=0077
+LimitCORE=0
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectSystem=strict
+ProtectHome=yes
+ReadWritePaths=/run/ssh-keys-sleep
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+RestrictAddressFamilies=AF_UNIX
+RestrictNamespaces=yes
+RestrictRealtime=yes
+LockPersonality=yes
+CapabilityBoundingSet=
+
+[Install]
+RequiredBy=sleep.target

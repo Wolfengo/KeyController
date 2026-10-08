@@ -1,0 +1,29 @@
+[Unit]
+Description=KeyController managed OpenSSH agent for UID %i
+BindsTo=ssh-keysd@%i.service ssh-keys-agent@%i.socket
+PartOf=ssh-keysd@%i.service
+After=ssh-keysd@%i.service ssh-keys-agent@%i.socket
+Requires=ssh-keys-agent@%i.socket
+OnFailure=ssh-keys-agent-failed@%i.service
+
+[Service]
+Slice=sshkeys.slice
+User=%i
+ExecStart=/usr/bin/ssh-agent -D -P ""
+Sockets=ssh-keys-agent@%i.socket
+KillMode=control-group
+TimeoutStopSec=1s
+LimitCORE=0
+MemorySwapMax=0
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectSystem=strict
+ProtectHome=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+RestrictNamespaces=yes
+RestrictRealtime=yes
+RestrictAddressFamilies=AF_UNIX
+LockPersonality=yes
+CapabilityBoundingSet=

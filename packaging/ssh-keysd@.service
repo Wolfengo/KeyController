@@ -1,0 +1,40 @@
+[Unit]
+Description=KeyController authorization and managed OpenSSH agent for UID %i
+Requires=systemd-logind.service
+After=systemd-logind.service
+Wants=ssh-keys-agent@%i.socket
+Before=ssh-keys-agent@%i.socket
+
+[Service]
+Slice=sshkeys.slice
+Type=simple
+ExecStart=/usr/lib/ssh-keys/ssh-keysd %i
+RuntimeDirectory=ssh-keys/%i
+RuntimeDirectoryMode=0711
+StateDirectory=ssh-keys/%i
+StateDirectoryMode=0700
+UMask=0077
+Restart=on-failure
+RestartSec=2s
+WatchdogSec=8s
+NotifyAccess=main
+KillMode=control-group
+TimeoutStopSec=2s
+LimitCORE=0
+MemorySwapMax=0
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectSystem=strict
+ReadWritePaths=/home /run/ssh-keys /var/lib/ssh-keys
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+RestrictNamespaces=yes
+RestrictRealtime=yes
+RestrictAddressFamilies=AF_UNIX
+LockPersonality=yes
+CapabilityBoundingSet=CAP_CHOWN CAP_DAC_OVERRIDE CAP_FOWNER CAP_SETUID CAP_SETGID CAP_KILL CAP_SYS_PTRACE
+
+[Install]
+WantedBy=multi-user.target

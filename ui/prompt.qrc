@@ -1,0 +1,5 @@
+<RCC>
+  <qresource prefix="/keycontroller">
+    <file alias="mark.svg">../plugin/icons/mark.svg</file>
+  </qresource>
+</RCC>

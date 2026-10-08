@@ -1,0 +1,380 @@
+#!/usr/bin/python3 -I
+"""Root-only, bounded systemd sleep coordination. No key material is read."""
+import concurrent.futures
+import fcntl
+import json
+import os
+from pathlib import Path
+import re
+import resource
+import socket
+import stat
+import struct
+import subprocess
+import sys
+import time
+
+STATE_DIRECTORY = Path('/run/ssh-keys-sleep')
+SLEEP_UNITS = ('sleep.target', 'systemd-suspend.service', 'systemd-hibernate.service',
+               'systemd-hybrid-sleep.service', 'systemd-suspend-then-hibernate.service')
+UNIT = re.compile(r'ssh-(?:keysd|keys-agent)@([1-9][0-9]*)\.(?:service|socket)\Z')
+MAX_USERS = 256
+
+
+class SleepError(Exception):
+    pass
+
+
+def uid_of(unit):
+    match = UNIT.fullmatch(unit)
+    if not match or int(match[1]) >= 2**32 - 1:
+        raise SleepError('invalid_managed_unit')
+    return int(match[1])
+
+
+def units_for(uid):
+    return [f'ssh-keysd@{uid}.service', f'ssh-keys-agent@{uid}.socket',
+            f'ssh-keys-agent@{uid}.service']
+
+
+class State:
+    def __init__(self, directory=STATE_DIRECTORY, owner=0):
+        self.directory = directory
+        self.owner = owner
+        self.lock = None
+
+    def check(self, path, directory=False):
+        m = path.lstat()
+        kind = stat.S_ISDIR(m.st_mode) if directory else stat.S_ISREG(m.st_mode)
+        if not kind or m.st_uid != self.owner or m.st_mode & 0o077 or (not directory and m.st_nlink != 1):
+            raise SleepError('unsafe_sleep_state')
+
+    def __enter__(self):
+        self.directory.mkdir(mode=0o700, parents=False, exist_ok=True)
+        self.check(self.directory, directory=True)
+        fd = os.open(self.directory / 'lock', os.O_CREAT | os.O_RDWR | os.O_NOFOLLOW | os.O_CLOEXEC, 0o600)
+        self.lock = os.fdopen(fd, 'rb')
+        self.check(self.directory / 'lock')
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            raise SleepError('sleep_coordinator_busy') from None
+        return self
+
+    def __exit__(self, *_):
+        if self.lock:
+            self.lock.close()
+
+    def sync(self):
+        fd = os.open(self.directory, os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC)
+        try:
+            os.fsync(fd)
+        finally:
+            os.close(fd)
+
+    def load(self):
+        # Keep a separate recovery record once the fence is lifted: a crash
+        # between unlinking the fence and resuming helpers must be recoverable.
+        for name in ('active', 'resuming'):
+            path = self.directory / name
+            try:
+                self.check(path)
+            except FileNotFoundError:
+                continue
+            with path.open('rb') as stream:
+                raw = stream.read(65537)
+            if len(raw) > 65536:
+                raise SleepError('invalid_sleep_state')
+            try:
+                value = json.loads(raw)
+                valid = (set(value) == {'version', 'helpers', 'stopped', 'prepared'} and type(value['version']) is int and value['version'] == 1
+                         and type(value['prepared']) is bool
+                         and all(isinstance(value[k], list) and len(value[k]) <= MAX_USERS
+                                 and all(type(uid) is int and 0 < uid < 2**32 - 1 for uid in value[k])
+                                 for k in ('helpers', 'stopped'))
+                         and set(value['stopped']) <= set(value['helpers']))
+                if not valid:
+                    raise ValueError()
+                return value
+            except (ValueError, TypeError, KeyError):
+                raise SleepError('invalid_sleep_state') from None
+        return None
+
+    def save(self, value, target='active'):
+        if target not in ('active', 'resuming'):
+            raise SleepError('invalid_sleep_state_target')
+        path = self.directory / target
+        temporary = self.directory / f'.{target}-{os.getpid()}-{time.monotonic_ns()}'
+        fd = os.open(temporary, os.O_CREAT | os.O_EXCL | os.O_WRONLY | os.O_NOFOLLOW | os.O_CLOEXEC, 0o600)
+        try:
+            with os.fdopen(fd, 'wb') as stream:
+                stream.write(json.dumps(value, separators=(',', ':')).encode())
+                stream.flush()
+                os.fsync(stream.fileno())
+            os.replace(temporary, path)
+            self.sync()
+        finally:
+            temporary.unlink(missing_ok=True)
+
+    def release(self):
+        path = self.directory / 'active'
+        if path.exists():
+            self.check(path)
+            os.replace(path, self.directory / 'resuming')
+            self.sync()
+
+    def finish(self):
+        for name in ('active', 'resuming'):
+            path = self.directory / name
+            if path.exists():
+                self.check(path)
+                path.unlink()
+        self.sync()
+
+
+class Manager:
+    def __init__(self, cgroup_root=Path('/sys/fs/cgroup')):
+        self.cgroup_root = cgroup_root
+
+    def run(self, *arguments, timeout=3):
+        try:
+            result = subprocess.run(['/usr/bin/systemctl', '--no-pager', *arguments],
+                                    stdin=subprocess.DEVNULL, capture_output=True, timeout=timeout,
+                                    env={'PATH': '/usr/bin', 'LANG': 'C.UTF-8', 'SYSTEMD_PAGER': 'cat'})
+        except (OSError, subprocess.TimeoutExpired):
+            raise SleepError('system_manager_timeout') from None
+        if result.returncode:
+            raise SleepError('system_manager_failed')
+        if len(result.stdout) > 2 * 1024 * 1024:
+            raise SleepError('system_manager_response_limit')
+        return result.stdout.decode('utf-8', 'strict')
+
+    def snapshot(self):
+        try:
+            rows = json.loads(self.run('--output=json', 'list-units', '--all', '--plain',
+                                      'ssh-keysd@*.service', 'ssh-keys-agent@*.socket', 'ssh-keys-agent@*.service'))
+            active = set()
+            helpers = set()
+            for row in rows:
+                uid = uid_of(row['unit'])
+                if row['active'] not in ('inactive', 'failed'):
+                    active.add(uid)
+                    if row['unit'] == f'ssh-keysd@{uid}.service':
+                        helpers.add(uid)
+            if len(active) > MAX_USERS:
+                raise SleepError('too_many_managed_users')
+            return active, helpers
+        except (ValueError, TypeError, KeyError):
+            raise SleepError('invalid_manager_response') from None
+
+    def show(self, units):
+        output = self.run('show', '--property=Id,ActiveState,MainPID,ControlPID,ControlGroup,Job', *units)
+        rows = {}
+        for block in output.strip().split('\n\n'):
+            values = dict(line.split('=', 1) for line in block.splitlines() if '=' in line)
+            if 'Id' in values:
+                rows[values['Id']] = values
+        if set(rows) != set(units):
+            raise SleepError('incomplete_manager_response')
+        return rows
+
+    def require_empty_group(self, group):
+        if not group:
+            return
+        path = Path(group)
+        if not path.is_absolute() or path == Path('/') or '..' in path.parts:
+            raise SleepError('unsafe_control_group')
+        try:
+            with (self.cgroup_root / str(path).lstrip('/') / 'cgroup.events').open() as stream:
+                data = stream.read(4097)
+        except FileNotFoundError:
+            # Called only after inactive/failed, empty PID and job checks. A
+            # cgroup already removed by the manager contains no live process.
+            return
+        except OSError:
+            raise SleepError('agent_stop_unconfirmed') from None
+        if len(data) > 4096 or dict(line.split(maxsplit=1) for line in data.splitlines()).get('populated') != '0':
+            raise SleepError('agent_stop_unconfirmed')
+
+    def stop(self, users):
+        if not users:
+            return
+        units = [unit for uid in sorted(users) for unit in units_for(uid)]
+        # Explicit stops inhibit Restart= and cover both socket activation and
+        # already connected backend/proxy clients. No process is killed by PID.
+        try:
+            self.run('stop', *units, timeout=5)
+        except SleepError:
+            # A timed-out client does not cancel the system manager's stop job.
+            # Continue only when the actual unit states independently prove it.
+            pass
+        rows = self.show(units)
+        if any(row.get('ActiveState') not in ('inactive', 'failed')
+               or row.get('MainPID', '0') != '0' or row.get('ControlPID', '0') != '0'
+               or row.get('Job') for row in rows.values()):
+            raise SleepError('agent_stop_unconfirmed')
+        for row in rows.values():
+            self.require_empty_group(row.get('ControlGroup', ''))
+
+    def start(self, users):
+        if users:
+            self.run('start', *(f'ssh-keysd@{uid}.service' for uid in sorted(users)), timeout=5)
+
+    def require_awake(self):
+        rows = self.show(SLEEP_UNITS)
+        if any(row.get('ActiveState') not in ('inactive', 'failed') or row.get('Job')
+               for row in rows.values()):
+            raise SleepError('sleep_transition_active')
+
+
+def admin(uid, action):
+    directory = Path(f'/run/ssh-keys/{uid}')
+    for path in (directory.parent, directory):
+        m = path.lstat()
+        if not stat.S_ISDIR(m.st_mode) or m.st_uid != 0 or m.st_mode & 0o022:
+            raise SleepError('unsafe_admin_directory')
+    path = directory / 'sleep.sock'
+    m = path.lstat()
+    if not stat.S_ISSOCK(m.st_mode) or m.st_uid != 0 or m.st_mode & 0o077:
+        raise SleepError('unsafe_admin_socket')
+    with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as stream:
+        stream.settimeout(1.5)
+        stream.connect(str(path))
+        _, uid_peer, _ = struct.unpack('3i', stream.getsockopt(socket.SOL_SOCKET, socket.SO_PEERCRED, 12))
+        if uid_peer != 0:
+            raise SleepError('wrong_admin_server')
+        stream.sendall(json.dumps({'api_version': 1, 'action': action}).encode() + b'\n')
+        data = bytearray()
+        deadline = time.monotonic() + 1.5
+        while not data.endswith(b'\n') and len(data) < 4096:
+            stream.settimeout(max(0.001, deadline - time.monotonic()))
+            if time.monotonic() >= deadline:
+                raise SleepError('admin_timeout')
+            byte = stream.recv(1)
+            if not byte:
+                break
+            data.extend(byte)
+    reply = json.loads(data)
+    if (reply.get('api_version') != 1 or reply.get('state') != 'ready'
+            or reply.get('operation') != action or reply.get('error_code') is not None
+            or type(reply.get('revoke_on_sleep')) is not bool):
+        raise SleepError('admin_rejected')
+    return reply['revoke_on_sleep']
+
+
+def call_many(users, action, call=admin):
+    if not users:
+        return {}, set()
+    executor = concurrent.futures.ThreadPoolExecutor(max_workers=min(16, len(users)))
+    futures = {executor.submit(call, uid, action): uid for uid in users}
+    succeeded = {}
+    try:
+        done, _ = concurrent.futures.wait(futures, timeout=3)
+        for future in done:
+            try:
+                succeeded[futures[future]] = future.result()
+            except Exception:
+                pass
+    finally:
+        # Every real IPC call has a bounded socket/deadline. Cancel queued work
+        # as well, so many unavailable users cannot make this wait unbounded.
+        executor.shutdown(wait=True, cancel_futures=True)
+    return succeeded, set(users) - set(succeeded)
+
+
+class Coordinator:
+    def __init__(self, state, manager, call=admin):
+        self.state, self.manager, self.call = state, manager, call
+
+    def prepare(self):
+        record = self.state.load() or {'version': 1, 'helpers': [], 'stopped': [], 'prepared': False}
+        record['prepared'] = False
+        # Fence first. New/restarted helpers must see this before any ADD.
+        self.state.save(record)
+        users, helpers = self.manager.snapshot()
+        record['helpers'] = sorted(set(record['helpers']) | helpers)
+        if len(record['helpers']) > MAX_USERS:
+            raise SleepError('too_many_managed_users')
+        # A previous resume may have restarted a helper before crashing while
+        # removing its journal. A currently active helper needs a new decision,
+        # not a stale restart that would revoke an opted-out identity on wake.
+        record['stopped'] = sorted(set(record['stopped']) - helpers)
+        self.state.save(record)
+        replies, failed = call_many(users, 'sleep.prepare', self.call)
+        stop = failed | {uid for uid, revoke in replies.items() if revoke}
+        record['stopped'] = sorted(set(record['stopped']) | (stop & set(record['helpers'])))
+        # Save restart intent before stopping anything, including crash paths.
+        self.state.save(record)
+        self.manager.stop(stop)
+        record['prepared'] = True
+        self.state.save(record)
+        return 'prepared'
+
+    def resume(self, recover=False):
+        self.manager.require_awake()
+        try:
+            record = self.state.load()
+        except SleepError as error:
+            if not recover or str(error) != 'invalid_sleep_state':
+                raise
+            # Explicit recovery may replace malformed root-owned metadata only
+            # after reconstructing current helper ownership from the manager.
+            # Unsafe ownership/path types are never accepted by this branch.
+            record = {'version': 1, 'helpers': [], 'stopped': [], 'prepared': False}
+        if record is None:
+            return 'already_resumed'
+        if not recover and not record['prepared']:
+            raise SleepError('sleep_recovery_required')
+        users, helpers = self.manager.snapshot()
+        if recover:
+            # An interrupted/failed preparation has no trustworthy ACK set.
+            # Empty every current agent before lifting the persistent fence.
+            record['helpers'] = sorted(set(record['helpers']) | helpers)
+            record['stopped'] = list(record['helpers'])
+            record['prepared'] = False
+            self.state.save(record)
+            self.manager.stop(users | set(record['helpers']))
+            record['prepared'] = True
+            self.state.save(record)
+            users = set()
+        self.state.release()
+        _, failed = call_many(users, 'sleep.resume', self.call)
+        if failed:
+            record['stopped'] = sorted(set(record['stopped']) | (failed & set(record['helpers'])))
+            # Persist new fallback/restart intent before stopping a failed
+            # resume client, without recreating the already released fence.
+            self.state.save(record, target='resuming')
+            self.manager.stop(failed)
+        self.manager.start(set(record['stopped']))
+        self.state.finish()
+        return 'recovered' if recover else 'resumed'
+
+    def remove(self):
+        # Package removal never restores identities or restarts a helper.
+        users, _ = self.manager.snapshot()
+        # Stop first even if a damaged recovery record cannot be parsed. The
+        # manager is authoritative for existing agents; dormant saved instances
+        # contain no process and must never be restarted during removal.
+        self.manager.stop(users)
+        self.state.finish()
+        return 'removed'
+
+
+def main():
+    if os.geteuid() != 0 or len(sys.argv) != 2 or sys.argv[1] not in ('prepare', 'resume', 'recover', 'remove'):
+        raise SystemExit('usage: sleep-coordinator prepare|resume|recover|remove (root)')
+    os.umask(0o077)
+    resource.setrlimit(resource.RLIMIT_CORE, (0, 0))
+    try:
+        with State() as state:
+            coordinator = Coordinator(state, Manager())
+            action = sys.argv[1]
+            outcome = coordinator.resume(recover=True) if action == 'recover' else getattr(coordinator, action)()
+        print('ssh-keys-sleep: ' + outcome)
+    except (SleepError, OSError, ValueError) as error:
+        print('ssh-keys-sleep: ' + (str(error) if isinstance(error, SleepError) else 'coordination_failed'), file=sys.stderr)
+        raise SystemExit(1) from None
+
+
+if __name__ == '__main__':
+    main()

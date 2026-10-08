@@ -1,0 +1,23 @@
+{
+  "schemaVersion": 1,
+  "id": "org.omarchy.keycontroller",
+  "name": "KeyController",
+  "version": "0.2.1",
+  "author": "KeyController contributors",
+  "license": "MIT AND Apache-2.0",
+  "description": "OpenSSH keys with per-key passphrase and fingerprint unlock",
+  "repository": "https://github.com/Wolfengo/KeyController",
+  "kinds": [
+    "bar-widget"
+  ],
+  "entryPoints": {
+    "barWidget": "plugin/Panel.qml"
+  },
+  "barWidget": {
+    "displayName": "KeyController",
+    "description": "Manage local SSH key access",
+    "category": "System",
+    "defaultSection": "right",
+    "allowMultiple": false
+  }
+}

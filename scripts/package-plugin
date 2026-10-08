@@ -1,0 +1,27 @@
+#!/usr/bin/python3
+"""Build the standalone widget from the canonical repository manifest."""
+import argparse
+import json
+from pathlib import Path, PurePosixPath
+import shutil
+
+
+def package_plugin(destination):
+    root = Path(__file__).resolve().parent.parent
+    manifest = json.loads((root / 'manifest.json').read_text())
+    for name, entry in manifest['entryPoints'].items():
+        path = PurePosixPath(entry)
+        if (path.is_absolute() or '..' in path.parts or len(path.parts) < 2
+                or path.parts[0] != 'plugin' or not (root / path).is_file()):
+            raise ValueError(f'Invalid plugin entry point: {entry}')
+        manifest['entryPoints'][name] = str(path.relative_to('plugin'))
+    shutil.copytree(root / 'plugin', destination,
+                    ignore=shutil.ignore_patterns('__pycache__', '*.pyc', '*.pyo'))
+    (destination / 'manifest.json').write_text(json.dumps(manifest, indent=2) + '\n')
+    shutil.copyfile(root / 'LICENSE', destination / 'LICENSE')
+
+
+if __name__ == '__main__':
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument('destination', type=Path, help='New directory for the widget')
+    package_plugin(parser.parse_args().destination)

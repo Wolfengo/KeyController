@@ -1,0 +1,71 @@
+# Security boundaries
+
+KeyController keeps passphrases and private key material out of the Omarchy widget and public CLI. It requires a fresh SSH passphrase or fingerprint authentication to load a closed key. It does not isolate a loaded agent from other processes of its user, protect against root or a compromised desktop, or revoke existing SSH connections.
+
+## Processes and authorization
+
+The privileged Rust service owns authorization, encrypted credentials and request state. File inspection, OpenSSH tools and the Qt6 prompt run as the key owner without supplementary groups. Loaders use fixed system executables and controlled environments; they do not trust a caller's executable search path or `SSH_AUTH_SOCK`. Third-party programs remain under their original package updates. KeyController's systemd units, PAM service and capture rule are its own integration files; no third-party implementation or lockscreen is copied or replaced.
+
+Interactive operations require an available, unlocked local Hyprland/logind session. The service verifies the unique system-bus owner holding session control, its UID/PID, process start time, session cgroup and root-owned Hyprland executable. It connects to Wayland, checks the socket peer and rechecks the session before passing that same connected descriptor to the prompt. The prompt has no default-display fallback. Controller identity currently depends on the private root-owned `/run/systemd/sessions/ID` format: missing, changed or ambiguous identity prevents the prompt from opening. This is an explicit compatibility dependency.
+
+Session observation cancels pending prompts when unavailability is reported. A lockscreen that does not publish `LockedHint` is not independently detected by that check. **Screen locking does not revoke loaded keys.** KeyController has no pre-lock hook or lockscreen replacement.
+
+The public API accepts only queries, unlock requests and unlock-request status/cancellation. Management requests and their identifiers are inaccessible through it. The separate desktop endpoint supports immediate revocation, preferred-method changes and global settings; other management operations require the protected native window. Both endpoints authenticate the peer UID and use root-owned runtime directories. No network listener is created.
+
+The desktop endpoint is not proof of human input. Another same-UID process can revoke a key, change its next preferred method, increase the duration of future inheriting loads, enable or disable future sleep revocation, or open a management dialog. Those direct actions cannot extend an existing timer, load a key, provide its passphrase or satisfy fingerprint authentication. Binding, file encryption, per-key policy changes and unbinding still require the native window's private consent/authentication flow. Caller executable names are display metadata, and supplied reasons are untrusted plain text.
+
+Fingerprint scanning starts automatically when a request window appears, including for eligible CLI requests made over SSH while the local desktop is unlocked. A finger supplied for another simultaneous action could satisfy the visible request. The window identifies the requester, but this is not strong authentication of the user's intent. One active operation per user, three new unlock windows per minute, a 30-second cooldown after cancellation/denial and a two-minute request deadline bound prompting. Management dialogs have a separate quota; see the [API contract](api.md).
+
+## Credentials and file changes
+
+The `ssh-keys-fingerprint` PAM service permits only `pam_fprintd`; it has no account-password fallback or cached Polkit authorization. Binding validates the SSH passphrase, performs fresh fingerprint authentication and seals the passphrase using `systemd-creds --with-key=host+tpm2 --tpm2-pcrs=7`. The authenticated credential name includes the UID and key fingerprint hash. Binding leaves the key closed. If TPM authorization or the credential is unavailable, the user can unlock with the SSH passphrase; no unattended rebinding or decryption fallback occurs.
+
+Loading uses the original `ssh-add` on a sealed encrypted snapshot. The service verifies the envelope fingerprint, and OpenSSH checks that the decrypted private identity matches it. The one-attempt askpass path returns the passphrase only once during loading. Errors exposed to clients are fixed codes, not raw command output. PAM progress likewise uses fixed messages; raw reader names and PAM text are not exported. Only the recognized request to supply a finger indicates scanner readiness.
+
+Adding a passphrase snapshots a user-owned regular file into a sealed memfd, runs `ssh-keygen -p` on a separate memory copy, and checks encryption, successful decryption and the public fingerprint. Only the encrypted result is written to a new mode-0600 file. The helper fsyncs it, rechecks the source identity/content and resolved path, atomically replaces the source, then syncs the directory. It creates no plaintext backup. Internal symlinks are preserved; external symlinks and multiple hard links are refused for modification.
+
+Cancellation before replacement leaves the original intact. A failure after replacement is reported as partial completion; plaintext is never restored automatically. Linux rename is not compare-and-swap against an arbitrary file version, so the final recheck cannot prevent races with an actively malicious process that can write the same directory. Existing plaintext copies, disk snapshots and stolen keys remain outside this operation's protection. Scanning reports recognizable plaintext copies only within `~/.ssh`.
+
+Settings use validated atomic writes. If replacement succeeds but directory syncing fails, the live policy follows the on-disk result and the caller receives a partial-completion warning. Duration changes apply only to future loads; sleep-policy changes apply to the next transition.
+
+## Agent lifetime and sleep
+
+The public agent socket proxies to a root-only backend socket; the original OpenSSH agent runs as the user. Connections preserve OpenSSH connection state, including session binding. Forwarded buffers are bounded and zeroized. Serialized identity mutations and connection generations prevent stale workers from restoring revoked access.
+
+Selective revocation cancels an unfinished unlock of that key before removing the identity. Ambiguous mutations or failed selective cleanup reset the entire managed agent. Helper termination stops its agent and backend socket; the helper watchdog also handles a wedged service. An agent restart starts empty, and no load is replayed after recovery. Revocation leaves established SSH sessions connected.
+
+OpenSSH enforces each loaded key's lifetime independently of the widget. Zero means unlimited. Foreign agent mutations make recorded expiry metadata unknown; they do not disable OpenSSH's own timers. On Linux, supported OpenSSH uses a clock including suspended time and checks expiry before later agent requests. No process executes during suspend, so expiry does not promise memory erasure at the exact deadline while asleep.
+
+Optional sleep revocation defaults to off and applies to the whole managed agent. The package's required service precedes the original systemd `sleep.target`. Its bounded root coordinator creates a root-only fence outside helper runtime directories, cancels and reaps pending workers, and fences additions in the proxy and newly started helpers. The separate sleep administration socket accepts only root peers.
+
+For opted-in users the coordinator stops the helper, agent and backend socket and verifies they are inactive. Closing listeners and connections prevents a delayed old addition after wake. Opted-out users retain loaded keys and timers, but unfinished requests are cancelled. An unreachable helper or unconfirmed preparation triggers a conservative whole-agent stop even for opted-out users. If stopping cannot be confirmed, standard systemd sleep fails and the fence remains; a coordinator timeout is failure.
+
+After wake or an aborted sleep following successful preparation, surviving helpers resume and previously stopped helpers return with empty agents. Explicit administrator recovery refuses an active/pending sleep transaction and empties agents before lifting the fence. Package removal removes its own required sleep dependency and stops its services; removing the widget alone does neither.
+
+This covers systemd suspend, hibernate, hybrid sleep and suspend-then-hibernate. Privileged direct kernel sleep can bypass it. Revocation is not a guarantee of forensic RAM erasure or removal of pre-existing hibernation and disk snapshots.
+
+## Secrets, crashes and desktop capture
+
+Secret processes use `RLIMIT_CORE=0`, no-new-privileges, non-dumpable state, descriptor allowlists and bounded lifetimes. The system cgroup disables swap. Fixed external executables load a packaged hardening constructor that reapplies non-dumpability after exec, before receiving any secret descriptors through its private startup handshake. Askpass is answered inside the already hardened child without another exec; an incompatible launch path fails closed.
+
+The secret-free bootstrap interval additionally requires Linux Yama `kernel.yama.ptrace_scope` of 1, 2 or 3. Workers descend from the root service, preventing unrelated same-UID processes from attaching in that interval. The service rechecks Yama before descriptor transfer and refuses secret operations if protection is unavailable. Core-size limits alone do not prevent a piped systemd-coredump; non-dumpability is essential.
+
+Passphrases travel through private inherited descriptors/memfds, never command arguments, environment values, widget IPC, logs or ordinary disk temporaries. Secret descriptors are close-on-exec. Passphrases exceeding 1023 UTF-8 bytes are rejected rather than silently truncated. The native window disables copying and context menus, clears input after submission and exits after the result. The Linux/OpenSSH/Qt runtime still holds transient memory copies; there is no formally verified zero-copy guarantee. Quickshell receives only metadata, so this integration supplies no passphrase or private key material to its crash dumps.
+
+Qt password masking alone is insufficient. The prompt uses the in-process `compose` input context and suppresses secret text/cursor queries through virtual, event and meta-object paths. It disables external input methods and accessibility exports within this short-lived window. Before QApplication starts, both accessibility and session-bus addresses are fixed to an unusable root-owned endpoint, and local accessibility events are discarded. **External screen readers are unavailable in the secret window.** Desktop accessibility configuration is unchanged. Regression tests cover Wayland text-input and AT-SPI exports with synthetic secrets and positive controls.
+
+The package-owned `keycontroller-hyprland.lua` rule targets the exact prompt layer using `no_screen_share` and disables animations with `no_anim`. Setup references the original package file, checks an unlocked session, backs up configuration, detects intervening changes and validates the reload. The protection requires a compatible Hyprland version and an active include; capture paths bypassing compositor enforcement are not covered.
+
+**Capture limitation:** synthetic tests on Hyprland 0.56.2 found pixels from a newly mapped layer outside the redaction mask during initial output allocation or parent-driven resizing. Settled-output captures through wlr-screencopy and ext-image-copy were redacted, but protection is not guaranteed for every display transition or recording backend. The suspected geometry/texture mismatch is an inference, not a confirmed upstream diagnosis. This finding does not establish that a password was visibly captured. Physical cameras and a compromised compositor are outside the protection boundary.
+
+Incoming SSH under the desktop UID is not a separate security identity. An account able to access the Wayland socket may register an input-method keyboard grab if the compositor permits it, even when the application suppresses text exports. Hyprland 0.56.2's input routing checks this grab independently of password-field hints. Application protections therefore cannot guarantee isolation from all input interception by the same account; that requires an OS/session boundary or compositor enforcement. Loaded-agent access is likewise available to other processes of the user.
+
+Localization uses a bounded reader for the root-owned `/etc/locale.conf` and reduces it to `ru` or `en`; it never sources shell code. Authentication tools retain their controlled C locale, and client environment variables or translations are not forwarded to secret-bearing commands.
+
+## Validation and references
+
+Automated tests use disposable keys and synthetic input. They cover key identity and passphrase failures, cancellation, file replacement, IPC restrictions, lifetime handling, service ordering, crash hardening and secret-text exports. Hardware fingerprint/TPM behavior, actual sleep transitions and installed SSH/Git workflows require validation on the target system; parser and UI tests alone do not establish them.
+
+- [Linux Yama](https://www.kernel.org/doc/html/latest/admin-guide/LSM/Yama.html) and [core-dump conditions](https://man7.org/linux/man-pages/man5/core.5.html).
+- OpenSSH 10.5: [clock selection](https://github.com/openssh/openssh-portable/blob/V_10_5_P1/misc.c#L1699), [agent expiry](https://github.com/openssh/openssh-portable/blob/V_10_5_P1/ssh-agent.c#L2534), [private identity validation](https://github.com/openssh/openssh-portable/blob/V_10_5_P1/sshkey.c#L3022) and [askpass](https://github.com/openssh/openssh-portable/blob/V_10_5_P1/readpass.c).
+- Hyprland 0.56.2: [capture rendering](https://github.com/hyprwm/Hyprland/blob/v0.56.2/src/managers/screenshare/ScreenshareFrame.cpp#L176-L260), [layer lifecycle](https://github.com/hyprwm/Hyprland/blob/v0.56.2/src/desktop/view/LayerSurface.cpp#L242-L259), [input routing](https://github.com/hyprwm/Hyprland/blob/v0.56.2/src/managers/input/InputManager.cpp#L1623-L1664) and [input-method grabs](https://github.com/hyprwm/Hyprland/blob/v0.56.2/src/protocols/InputMethodV2.cpp#L204-L218).

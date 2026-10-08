@@ -1,0 +1,38 @@
+[package]
+name = "keycontroller"
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+description = "Session-scoped OpenSSH key management for Omarchy"
+
+[lib]
+name = "ssh_keys"
+
+[[bin]]
+name = "ssh-keysd"
+path = "src/bin/daemon.rs"
+
+[[bin]]
+name = "kctrl"
+path = "src/bin/cli.rs"
+
+[[bin]]
+name = "ssh-keys-panel-client"
+path = "src/bin/panel.rs"
+
+[dependencies]
+base64 = "0.22"
+libc = "0.2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.10"
+zeroize = { version = "1", features = ["derive"] }
+zbus = { version = "5", default-features = false, features = ["blocking-api", "async-io"] }
+
+[dev-dependencies]
+tempfile = "3"
+
+[profile.release]
+panic = "abort"
+strip = true
+lto = "thin"

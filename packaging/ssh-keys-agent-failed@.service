@@ -1,0 +1,12 @@
+[Unit]
+Description=Cancel pending KeyController operations after an agent crash for UID %i
+
+[Service]
+Type=oneshot
+ExecStart=/usr/bin/systemctl --no-block restart ssh-keysd@%i.service
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+RestrictAddressFamilies=AF_UNIX
+CapabilityBoundingSet=

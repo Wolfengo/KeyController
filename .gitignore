@@ -1,0 +1,8 @@
+/target/
+/.cargo-cache/
+/build/
+/pkg/
+/dist/
+*.pkg.tar.zst
+__pycache__/
+*.py[cod]

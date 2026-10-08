@@ -1,0 +1,170 @@
+#!/bin/sh
+# Minimal bootstrap for a plugin-only installation without Python. No shell
+# evaluation of metadata or locale files and no privileged plugin execution.
+set -f
+PATH=/usr/bin
+LANG=C
+LC_ALL=C
+export PATH LANG LC_ALL
+PYTHON=/usr/bin/python3
+PACMAN=/usr/bin/pacman
+PACMAN_CONF=/usr/bin/pacman-conf
+SUDO=/usr/bin/sudo
+TIMEOUT=/usr/bin/timeout
+FLOCK=/usr/bin/flock
+STAT=/usr/bin/stat
+
+case "$#:$1:${2-}" in
+    1:--install:) mode=install ;;
+    1:--setup:) mode=setup ;;
+    1:--check:|2:--check:--json) mode=check ;;
+    *) echo 'Usage: dependencies --check --json | --install | --setup' >&2; exit 2 ;;
+esac
+
+if [ -x "$PYTHON" ]; then
+    exec "$PYTHON" -I "$(dirname -- "$0")/dependencies.py" "$@"
+fi
+if [ "$mode" = setup ]; then
+    echo 'KeyController: python_required. Install the required packages before setup.' >&2
+    exit 1
+fi
+
+uid=$(/usr/bin/id -u) || exit 1
+runtime=/run/user/$uid
+lock=$runtime/keycontroller-dependencies.lock
+repository=
+reason=repository_unavailable
+available=false
+installing=false
+error_code=python_required
+state=missing
+
+run() { "$TIMEOUT" 8 "$@"; }
+valid_lock() {
+    [ ! -L "$lock" ] && [ -f "$lock" ] &&
+        [ "$("$STAT" -c '%u %a %h' -- "$lock" 2>/dev/null)" = "$uid 600 1" ]
+}
+emit() {
+    if [ -n "$repository" ]; then repo_json="\"$repository\""; else repo_json=null; fi
+    # Before Python is available, only its bootstrap requirement is known.
+    # Locale and the complete list are evaluated by Python on the next check.
+    if [ "$state" = error ]; then missing='[]'; else
+        missing="[{\"name\":\"python\",\"requirement\":\"python\",\"repository\":$repo_json,\"available\":$available,\"reason\":$reason_json}]"
+    fi
+    printf '{"schema_version":1,"state":"%s","ui_language":"en","missing":%s,"optional":{},"complete":false,"setup_required":false,"migration_required":false,"installable":%s,"installing":%s,"error_code":"%s"}\n' \
+        "$state" "$missing" "$available" "$installing" "$error_code"
+}
+fail() { state=error; available=false; error_code=$1; }
+
+if [ "$uid" = 0 ]; then
+    fail root_not_allowed
+else
+    needs=$(run "$PACMAN" -T python 2>/dev/null)
+    result=$?
+    if [ "$result" = 0 ]; then
+        fail python_unavailable
+    elif [ "$result" = 124 ]; then
+        fail package_check_timeout
+    elif [ "$result" != 127 ] || [ "$needs" != python ]; then
+        fail package_check_failed
+    else
+        metadata=$(run "$PACMAN" -Si python 2>/dev/null)
+        result=$?
+        if [ "$result" = 124 ]; then
+            fail package_check_timeout
+        elif [ "$result" != 0 ] && [ "$result" != 1 ]; then
+            fail package_manager_unavailable
+        elif [ "$result" = 0 ]; then
+            name=
+            while IFS= read -r line; do
+                case "$line" in
+                    Repository*:*|Name*:*)
+                        value=${line#*:}
+                        # Metadata names contain no whitespace. Split without
+                        # globbing (set -f) and reject multiple words.
+                        set -- $value
+                        if [ "$#" != 1 ]; then fail package_metadata_invalid; break; fi
+                        case "$line" in Repository*) repository=$1;; Name*) name=$1;; esac
+                        ;;
+                    '') [ -n "$name" ] && break ;;
+                esac
+            done <<EOF
+$metadata
+EOF
+            case "$repository" in ''|*[!A-Za-z0-9_.+-]*) fail package_metadata_invalid ;; esac
+            [ "$name" = python ] || fail package_metadata_invalid
+            repos=$(run "$PACMAN_CONF" --repo-list 2>/dev/null)
+            [ "$?" = 0 ] || fail repository_config_invalid
+            found=false
+            for candidate in $repos; do
+                [ "$candidate" = "$repository" ] && found=true
+            done
+            [ "$found" = true ] || fail repository_config_invalid
+            if [ "$state" != error ]; then
+                signatures=$(run "$PACMAN_CONF" SigLevel 2>/dev/null)
+                [ "$?" = 0 ] || fail repository_config_invalid
+                overrides=$(run "$PACMAN_CONF" --repo "$repository" SigLevel 2>/dev/null)
+                [ "$?" = 0 ] || fail repository_config_invalid
+                required=false
+                trusted=false
+                for token in $signatures $overrides; do
+                    case "$token" in
+                        Required|PackageRequired) required=true ;;
+                        Optional|Never|PackageOptional|PackageNever) required=false ;;
+                        TrustedOnly|PackageTrustedOnly) trusted=true ;;
+                        TrustAll|PackageTrustAll) trusted=false ;;
+                        Database*) ;;
+                        *) fail repository_config_invalid ;;
+                    esac
+                done
+                if [ "$state" != error ]; then
+                    if [ "$required:$trusted" = true:true ]; then
+                        available=true
+                        reason=
+                    else
+                        reason=repository_signatures_disabled
+                    fi
+                fi
+            fi
+        fi
+    fi
+fi
+if valid_lock && ! (exec 9<"$lock"; "$FLOCK" -n 9) 2>/dev/null; then installing=true; fi
+if [ -n "$reason" ]; then reason_json="\"$reason\""; else reason_json=null; fi
+if [ "$mode" = check ]; then
+    emit
+    [ "$state" != error ]
+    exit
+fi
+
+finish_failure() {
+    printf 'KeyController: %s.\n' "$1" >&2
+    if [ -t 0 ] && [ -t 1 ]; then
+        printf 'Press Enter to close this window… '
+        IFS= read -r _ || :
+    fi
+    exit 1
+}
+[ -t 0 ] && [ -t 1 ] || finish_failure interactive_terminal_required
+[ "$state" != error ] || finish_failure "$error_code"
+[ "$available" = true ] || finish_failure "$reason"
+[ ! -L "$runtime" ] && [ -d "$runtime" ] &&
+    [ "$("$STAT" -c '%u %a' -- "$runtime" 2>/dev/null)" = "$uid 700" ] || finish_failure install_lock_unavailable
+umask 077
+(set -C; : >"$lock") 2>/dev/null || :
+valid_lock || finish_failure install_lock_unavailable
+exec 9<"$lock" || finish_failure install_lock_unavailable
+"$FLOCK" -n 9 || finish_failure installation_busy
+# Recheck after taking the lock: another window may have installed Python.
+needs=$(run "$PACMAN" -T python 2>/dev/null)
+result=$?
+if [ "$result" = 0 ] && [ -x "$PYTHON" ]; then
+    printf 'Python is available. Reopen KeyController to check the remaining packages.\n'
+    exit 0
+fi
+[ "$result" = 127 ] && [ "$needs" = python ] || finish_failure package_check_failed
+printf 'KeyController: install python [%s].\n' "$repository"
+printf 'Only Python will be installed now. Pacman will show its dependencies and request confirmation.\n'
+"$SUDO" "$PACMAN" -S --needed -- "$repository/python" 9<&- || finish_failure package_install_failed
+[ -x "$PYTHON" ] && run "$PACMAN" -T python >/dev/null 2>&1 || finish_failure dependencies_still_missing
+printf 'Python installed. Reopen KeyController to review the complete package list.\n'

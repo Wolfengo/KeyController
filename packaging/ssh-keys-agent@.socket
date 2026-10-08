@@ -1,0 +1,21 @@
+[Unit]
+Description=Private OpenSSH agent socket for KeyController UID %i
+# This socket starts after the regular helper service. The usual socket
+# Before=sockets.target would create socket -> sockets.target -> basic.target
+# -> helper -> socket during boot. Keep init/shutdown ordering explicitly.
+DefaultDependencies=no
+Requires=sysinit.target
+Conflicts=shutdown.target
+Before=shutdown.target
+BindsTo=ssh-keysd@%i.service
+PartOf=ssh-keysd@%i.service
+After=sysinit.target ssh-keysd@%i.service
+
+[Socket]
+ListenStream=/run/ssh-keys/%i/backend.sock
+SocketUser=root
+SocketGroup=root
+SocketMode=0600
+DirectoryMode=0711
+RemoveOnStop=yes
+Service=ssh-keys-agent@%i.service

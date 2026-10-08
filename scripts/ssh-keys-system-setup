@@ -1,0 +1,28 @@
+#!/usr/bin/python3 -I
+"""Installed root-owned administrative setup; no SSH passphrases accepted."""
+import os
+from pathlib import Path
+import pwd
+import subprocess
+import sys
+
+
+def main():
+    if os.geteuid() != 0 or len(sys.argv) != 3 or sys.argv[1] != 'enable':
+        raise SystemExit('usage: system-setup enable UID (root)')
+    try:
+        uid = int(sys.argv[2])
+    except ValueError:
+        raise SystemExit('A local non-root desktop UID is required') from None
+    if uid < 1000 or str(uid) != sys.argv[2]:
+        raise SystemExit('A local non-root desktop UID is required')
+    user = pwd.getpwuid(uid)
+    if not Path(user.pw_dir).is_dir():
+        raise SystemExit('Missing user home')
+    subprocess.run(['/usr/bin/systemd-creds', 'setup'], check=True)
+    subprocess.run(['/usr/bin/systemctl', 'daemon-reload'], check=True)
+    subprocess.run(['/usr/bin/systemctl', 'enable', '--now', f'ssh-keysd@{uid}.service'], check=True)
+
+
+if __name__ == '__main__':
+    main()
