@@ -10,6 +10,48 @@ import subprocess
 import sys
 import tempfile
 import time
+import xml.etree.ElementTree as ET
+
+
+def status_property(introspection):
+    """Use the writable activation property actually exported by this release."""
+    node = ET.fromstring(introspection)
+    interfaces = node.findall("./interface[@name='org.a11y.Status']")
+    if len(interfaces) != 1:
+        raise RuntimeError("private accessibility status interface is missing or ambiguous")
+    # AT-SPI 2.62 removed ScreenReaderEnabled; IsEnabled remains writable.
+    # Older Qt/AT-SPI combinations still need the former property explicitly.
+    for name in ("ScreenReaderEnabled", "IsEnabled"):
+        properties = interfaces[0].findall(f"./property[@name='{name}']")
+        if properties:
+            if len(properties) != 1 or properties[0].get('type') != 'b' or properties[0].get('access') != 'readwrite':
+                raise RuntimeError("private accessibility activation property is not writable boolean")
+            return name
+    raise RuntimeError("private accessibility bus has no supported activation property")
+
+
+def preflight_dbus(environment, subcommand, *arguments):
+    # Called only before fixture input exists. Keep diagnostics from this
+    # private startup bus, never dump fixture/observer output containing input.
+    result = subprocess.run([
+        "/usr/bin/gdbus", subcommand, "--session", "--dest", "org.a11y.Bus",
+        "--object-path", "/org/a11y/bus", *arguments], env=environment,
+        text=True, capture_output=True, timeout=5)
+    if result.returncode:
+        detail = ascii(result.stderr.strip()[:2048])
+        raise RuntimeError(f"private accessibility preflight failed ({result.returncode}): {detail}")
+    return result.stdout
+
+
+def enable_accessibility(environment):
+    introspection = preflight_dbus(environment, "introspect", "--xml")
+    name = status_property(introspection)
+    preflight_dbus(environment, "call", "--method", "org.freedesktop.DBus.Properties.Set",
+                   "org.a11y.Status", name, "<true>")
+    value = preflight_dbus(environment, "call", "--method", "org.freedesktop.DBus.Properties.Get",
+                          "org.a11y.Status", name)
+    if value.strip() != "(<true>,)":
+        raise RuntimeError("private accessibility activation did not become true")
 
 
 def ready_line(process, timeout=5):
@@ -39,17 +81,11 @@ def run(fixture, listener):
                 raise RuntimeError("unexpected private session-bus address")
             environment["DBUS_SESSION_BUS_ADDRESS"] = address
 
-            def call(*arguments):
-                return subprocess.check_output([
-                    "/usr/bin/gdbus", "call", "--session", "--dest", "org.a11y.Bus",
-                    "--object-path", "/org/a11y/bus", *arguments], env=environment,
-                    text=True, stderr=subprocess.DEVNULL, timeout=5)
-
-            accessibility = ast.literal_eval(call("--method", "org.a11y.Bus.GetAddress"))[0]
+            accessibility = ast.literal_eval(preflight_dbus(
+                environment, "call", "--method", "org.a11y.Bus.GetAddress"))[0]
             if not accessibility.startswith("unix:path=" + temporary + "/"):
                 raise RuntimeError("accessibility bus escaped the private runtime")
-            call("--method", "org.freedesktop.DBus.Properties.Set", "org.a11y.Status",
-                 "ScreenReaderEnabled", "<true>")
+            enable_accessibility(environment)
             # The isolated session has no systemd user manager. Start its own
             # registry explicitly instead of relying on broker activation.
             registry = subprocess.Popen(["/usr/lib/at-spi2-registryd"],
