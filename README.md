@@ -61,9 +61,17 @@ The **+** button lets you add a passphrase to an unencrypted key. Its public ide
 
 ## Let your tools ask for access
 
-Scripts and AI agents can request a key through **`kctrl`**. You see the request in the same authentication window; the tool receives the result without receiving your passphrase. A key that is already open is reused without extending its timer.
+**AI agents, applications and your own scripts** can request a key through **`kctrl`**. You see who requested access and why in the same authentication window; the calling tool receives the result without receiving your passphrase. A key that is already open is reused without extending its timer.
 
-Instructions for **Codex, Claude Code and OpenCode** are included and connected during setup when those clients are present. [Agent workflow](skills/keycontroller/SKILL.md) · [CLI and API](docs/api.md)
+For example, add an unlock request to a deployment script before its SSH step:
+
+```sh
+kctrl keys unlock --key '<key-id>' --interactive --reason 'Deploy application' --json
+```
+
+The script waits for your fingerprint or passphrase in your unlocked local desktop session, then continues only when the key is unlocked. The command returns immediately: if the result is `pending`, the script must track the returned request ID with `kctrl requests status` until `unlocked`, and stop on cancellation, denial, expiry or error. [CLI and request states](docs/api.md)
+
+Instructions for **Codex, Claude Code and OpenCode** are included and connected during setup when those clients are present. [Agent workflow](skills/keycontroller/SKILL.md)
 
 ## Fits your desktop
 
