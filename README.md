@@ -2,6 +2,9 @@
 
 **SSH key access, right from your Omarchy bar.**
 
+> [!TIP]
+> **AI agents can request SSH key unlocks on their own.** When your agent needs SSH or Git access, it can ask KeyController to open the authentication window. You grant access with your fingerprint or the key's passphrase.
+
 Unlock with a passphrase or fingerprint, choose how long a key stays available, and close access with a click.
 
 <p align="center">
