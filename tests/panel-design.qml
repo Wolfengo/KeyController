@@ -117,19 +117,18 @@ ShellRoot {
       } else if (test.phase === 4) {
         test.check(panel.settingsOpen && panel.settingsKey === "SHA256:test2", "individual settings state")
         test.phase = 5
-        test.capture("key-settings")
+        test.capture("key-details")
       } else if (test.phase === 5) {
-        panel.settingsFor(null)
+        panel.settingsOpen = false
+        panel.receiveScanStatus({scanned:false, scan_root:"/test/.ssh", scan_requires_consent:true})
         test.phase = 6
         next.restart()
       } else if (test.phase === 6) {
-        test.check(panel.settingsOpen && panel.settingsKey === "" && !panel.settingsRow, "global settings state")
-        var sleep = test.find(panel, function(o) { return o.objectName === "ssh-keys-revoke-on-sleep" })
-        var label = test.find(sleep, function(o) { return o.text === sleep.label && o.font !== undefined && typeof o.mapToItem === "function" })
-        test.check(label && label.contentWidth <= label.width + 0.5, "general sleep label exceeds available width")
-        test.controlFits(test.find(panel, function(o) { return o.objectName === "ssh-key-save-rules" }), test.popup.contentItem[0])
+        test.check(panel.needsInitialScan, "first scan consent missing")
+        var scan = test.find(panel, function(o) { return o.objectName === "ssh-keys-confirm-scan" })
+        test.controlFits(scan, test.popup.contentItem[0])
         test.phase = 7
-        test.capture("global-settings")
+        test.capture("discovery")
       } else {
         test.check(test.captured.length === 4, "missing visual state")
         panel.close()

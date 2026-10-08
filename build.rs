@@ -20,6 +20,8 @@ fn main() {
             .unwrap()
             .success()
     );
+    // Only cfg(test)/debug_assertions may reference this compile-time path.
+    // Production release code uses the package-owned installed library.
     println!(
         "cargo:rustc-env=SSH_KEYS_BUILD_HARDEN={}",
         library.display()

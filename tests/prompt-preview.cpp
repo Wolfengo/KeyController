@@ -44,9 +44,12 @@ public:
       backdrop->showFullScreen();
     }
 
-    fingerprint = qEnvironmentVariable("SSH_KEYS_PROMPT_PREVIEW_OPERATION") == QStringLiteral("fingerprint");
+    const auto previewOperation = qEnvironmentVariable("SSH_KEYS_PROMPT_PREVIEW_OPERATION");
+    fingerprint = previewOperation == QStringLiteral("fingerprint");
+    if (previewOperation == "settings.global" || previewOperation == "settings.key")
+      policyOperation = previewOperation;
     QTimer::singleShot(450, this, [this] {
-      message({{"operation", fingerprint ? "unlock" : "sync"},
+      QJsonObject job{{"operation", fingerprint ? "unlock" : "sync"},
                {"key", QJsonObject{{"name", QStringLiteral("Production")},
                                    {"path", "/test/.ssh/key"},
                                    {"fingerprint", "SHA256:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"}}},
@@ -54,7 +57,16 @@ public:
                {"bound", fingerprint},
                {"fingerprint_mode", fingerprint},
                {"caller", "/usr/lib/ssh-keys/panel-client (PID 1234)"},
-               {"reason", QStringLiteral("Request from KeyController")}});
+               {"reason", QStringLiteral("Request from KeyController")}};
+      if (!policyOperation.isEmpty()) {
+        job["operation"] = policyOperation;
+        if (policyOperation == "settings.global") {
+          job["key"] = QJsonValue(QJsonValue::Null);
+          job["value"] = QJsonObject{{"lifetime_seconds", 60}, {"revoke_on_sleep", true}};
+        } else job["value"] = QJsonObject{{"inherits", true}, {"lifetime_seconds", 3600},
+                                          {"global_lifetime_seconds", 3600}};
+      }
+      message(job);
       next();
     });
     QTimer::singleShot(12000, this, [this] { fail("visual fixture timed out"); });
@@ -72,6 +84,7 @@ private:
   int peer = -1;
   int phase = 0;
   bool finished = false, fingerprint = false;
+  QString policyOperation;
   QJsonArray captures;
   std::unique_ptr<Prompt> prompt;
   std::unique_ptr<QWidget> backdrop;
@@ -126,8 +139,15 @@ private:
     }
     QJsonParseError error;
     const auto document = QJsonDocument::fromJson(packet, &error);
-    const auto expected = QJsonObject{{"consent", true}, {"mode", fingerprint ? "fingerprint" : "password"},
+    auto expected = QJsonObject{{"consent", true}, {"mode", fingerprint ? "fingerprint" : "password"},
                                      {"passphrase", fingerprint ? QString() : sample}, {"confirmation", ""}};
+    if (!policyOperation.isEmpty()) {
+      const auto value = policyOperation == "settings.global"
+          ? QJsonObject{{"lifetime_seconds", 900}, {"revoke_on_sleep", true}}
+          : QJsonObject{{"inherits", false}, {"lifetime_seconds", 900}};
+      expected = QJsonObject{{"consent", true}, {"mode", "settings"}, {"passphrase", ""},
+                             {"confirmation", ""}, {"value", value}};
+    }
     const bool valid = error.error == QJsonParseError::NoError &&
                        document.isObject() && document.object() == expected;
     packet.fill('\0');
@@ -236,6 +256,24 @@ private:
 
   void advance() {
     if (finished) return;
+    if (!policyOperation.isEmpty()) {
+      if (phase == 0) {
+        if (!noReply() || !capture("initial")) return;
+        afterCapture([this] {
+          if (policyOperation == "settings.global") control<QCheckBox>("policy-sleep")->setChecked(true);
+          else control<QCheckBox>("policy-inherit")->setChecked(false);
+          auto *preset = control<QComboBox>("policy-lifetime");
+          preset->setCurrentIndex(preset->findData(900));
+          return true;
+        });
+      } else {
+        if (!noReply() || !capture("edited")) return;
+        control<QPushButton>("consent")->click();
+        if (!validateReply()) return;
+        finishPreview();
+      }
+      return;
+    }
     if (fingerprint) { advanceFingerprint(); return; }
     auto *proceed = control<QPushButton>("consent");
     auto *password = control<QLineEdit>("passphrase");

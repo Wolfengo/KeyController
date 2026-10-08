@@ -46,11 +46,19 @@ Run setup as the desktop user in an unlocked local session. It connects the mana
 
 The public agent socket is `/run/ssh-keys/UID/agent.sock`, and the helper service is `ssh-keysd@UID.service`. These private identifiers are retained for installation compatibility. Setup preserves an existing KeyController checkout and its bar position. Update a Git-installed widget with `omarchy plugin update org.omarchy.keycontroller`; update the privileged helper separately through its package. If no widget exists, setup creates a link to `/usr/share/keycontroller/plugin`, which then receives widget updates through the package manager. Restart the shell with `omarchy restart shell` after QML updates, while the screen is unlocked.
 
-Widget version `0.2.2` and system package version `0.1.0-24` are maintained separately; API v1 is their compatibility boundary. Setup records completion only after all configuration steps and the Hyprland reload succeed. If setup was interrupted, use **Set up KeyController** again or rerun `keycontroller-setup --apply`; an enabled service alone does not count as completed setup.
+Widget version `0.3.0` and system package version `0.1.1-1` are maintained separately; API v1 is their compatibility boundary. Setup records completion only after all configuration steps and the Hyprland reload succeed. If setup was interrupted, use **Set up KeyController** again or rerun `keycontroller-setup --apply`; an enabled service alone does not count as completed setup.
 
 For Omarchy plugin distribution, the repository's root `manifest.json` points to `plugin/Panel.qml`. The source packaging script also produces a standalone widget archive under `dist/`. The widget checks runtime dependencies and shows **Install and set up** with the missing requirements when needed. If packages are already present, **Set up KeyController** starts the same wizard at the configuration step. Key controls stay unavailable until setup has completed and the wizard has released its installation lock.
 
-Required runtime packages are `keycontroller>=0.1.0-24`, `openssh>=10.5p1`, `qt6-base`, `qt6-svg`, `qt6-wayland`, `layer-shell-qt>=6.6`, `systemd`, `pam`, `python` and `polkit`. Linux 6.5 or newer, an active local Hyprland/logind session and Yama `kernel.yama.ptrace_scope` of 1, 2 or 3 are required. Fingerprint use additionally requires `fprintd`, a system-enrolled fingerprint and TPM2. Passphrase unlocking remains available without biometric hardware.
+Required runtime packages are `keycontroller>=0.1.1-1`, `openssh>=10.5p1`, `qt6-base`, `qt6-svg`, `qt6-wayland`, `layer-shell-qt>=6.6`, `systemd`, `pam`, `python` and `polkit`. Linux 6.5 or newer, an active local Hyprland/logind session and Yama `kernel.yama.ptrace_scope` of 1, 2 or 3 are required. Fingerprint use additionally requires `fprintd`, a system-enrolled fingerprint and TPM2. Passphrase unlocking remains available without biometric hardware.
+
+## First use and access rules
+
+Before the first key discovery, the widget names the scan folder (`~/.ssh`) and asks you to allow a recursive search. Declining leaves discovery unstarted. Later scans are manual through Refresh or the add-key view; this is a desktop UI choice, not a separate security identity for same-UID processes.
+
+A fresh installation starts with a **60-second access duration** and **Revoke before sleep enabled**. Updating an existing installation preserves its saved durations and sleep preference, including unlimited access. Older settings without a sleep field retain their previous disabled behavior.
+
+The header gear opens general settings in the protected native window. A key's gear opens that key's access rules, including inheritance. Set the policy there and choose **Save** once; no password or fingerprint is needed for editing policy. Cancel closes the editor without applying its changes. Click a key's name to view its details or unlink its fingerprint. Preferred-method switching and **Lock** remain immediate widget actions.
 
 ## Agent and script access
 
@@ -75,7 +83,7 @@ For an existing `ssh-keys` package installation, `keycontroller` retains its pri
 
 KeyController uses the original system OpenSSH, systemd, Qt, PAM and fprintd packages. Its own systemd units, PAM policy and Hyprland capture rule are separate integration files. It does not copy, patch or replace a lockscreen, compositor or other third-party implementation.
 
-Optional sleep revocation is provided by a required service before the original systemd `sleep.target`. It fences new loads, cancels pending operations and stops opted-in managed agents before sleep. After wake, stopped agents return empty. If safe preparation cannot be confirmed, standard systemd sleep fails. Removing the widget does not remove this system-package policy; uninstalling the package removes its own services and dependency. After a failed transition, an administrator can recover while awake with `pkexec /usr/lib/ssh-keys/sleep-coordinator recover`; recovery empties managed agents before lifting the fence.
+Configurable sleep revocation, enabled by default only on fresh installations, is provided by a required service before the original systemd `sleep.target`. It fences new loads, cancels pending operations and stops opted-in managed agents before sleep. After wake, stopped agents return empty. If safe preparation cannot be confirmed, standard systemd sleep fails. Removing the widget does not remove this system-package policy; uninstalling the package removes its own services and dependency. After a failed transition, an administrator can recover while awake with `pkexec /usr/lib/ssh-keys/sleep-coordinator recover`; recovery empties managed agents before lifting the fence.
 
 The prompt's package-owned Hyprland rule masks its layer in supported compositor captures and disables closing animations. `keycontroller-setup --protect-prompt` installs only this integration. Capture protection has an output-startup/resizing limitation and does not provide isolation from the same desktop account; read the [security design](security.md) before relying on it.
 
@@ -113,4 +121,4 @@ cmake --build build
 ctest --test-dir build --output-on-failure
 ```
 
-The package's `check()` function runs the Rust, Qt and Python regression suites. `scripts/package-source` creates the source archive, its checksum-pinned PKGBUILD and the standalone widget archive.
+The package's `check()` function runs the Rust, Qt and Python regression suites. Read [build integrity and reproducible exports](build-security.md) before preparing release artifacts; local checks do not substitute for the isolated verification workflow or hardware acceptance. `scripts/package-source` creates the source archive, its checksum-pinned PKGBUILD and the standalone widget archive.

@@ -25,7 +25,7 @@ with tempfile.TemporaryDirectory(prefix='ssh-keys-design-test-') as directory:
     print(result.stdout, end='')
     if result.returncode or 'SSH_KEYS_DESIGN_REGRESSION_OK' not in result.stdout or 'DESIGN_REGRESSION_FAILED' in result.stdout:
         raise SystemExit(1)
-    for state in ('main', 'candidates', 'key-settings', 'global-settings'):
+    for state in ('main', 'candidates', 'key-details', 'discovery'):
         image = output / (state + '.png')
         if not image.is_file() or image.stat().st_size == 0:
             raise SystemExit(f'Missing visual capture: {image}')

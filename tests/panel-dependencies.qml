@@ -92,7 +92,7 @@ ShellRoot {
       test.check(!panel.dependenciesReady && button.enabled, "unfinished migration was considered ready")
       test.deps.fail("invalid_response")
       test.check(!button.enabled, "failed setup check left setup action enabled")
-      test.deps.accept(test.report("missing", [{name:"keycontroller",requirement:"keycontroller>=0.1.0-24",repository:null,available:false,reason:"repository_unavailable"}], false))
+      test.deps.accept(test.report("missing", [{name:"keycontroller",requirement:"keycontroller>=0.1.1-1",repository:null,available:false,reason:"repository_unavailable"}], false))
       test.check(!button.enabled && !row.visible, "unavailable helper offered installation")
       test.check(button.text === "Package not yet available", "unavailable helper has misleading install action")
       var packageStatus = test.find(panel, "ssh-keys-package-status")

@@ -1,5 +1,7 @@
 #include <QApplication>
 #include <QAccessible>
+#include <QCheckBox>
+#include <QComboBox>
 #include <QDialog>
 #include <QFrame>
 #include <QGuiApplication>
@@ -14,11 +16,14 @@
 #include <QScrollArea>
 #include <QScrollBar>
 #include <QSocketNotifier>
+#include <QSpinBox>
+#include <QStyleOptionButton>
 #include <QSvgRenderer>
 #include <QTimer>
 #include <QVBoxLayout>
 #include <QWindow>
 #include <LayerShellQt/Window>
+#include <cmath>
 #include <sys/prctl.h>
 #include <sys/resource.h>
 #include <sys/socket.h>
@@ -85,6 +90,42 @@ private:
   int angle = 0;
 };
 
+// Preserve native checkbox interaction while making a checked policy explicit
+// even when the Omarchy accent is gray. No theme-supplied image or QSS is loaded.
+class PolicyCheckBox final : public QCheckBox {
+public:
+  PolicyCheckBox(const QString &caption, const QColor &accent, QWidget *parent)
+      : QCheckBox(caption, parent), checkColor(contrastingMark(accent)) {}
+protected:
+  void paintEvent(QPaintEvent *event) override {
+    QCheckBox::paintEvent(event);
+    if (!isChecked()) return;
+    QStyleOptionButton option;
+    initStyleOption(&option);
+    const QRectF indicator = style()->subElementRect(QStyle::SE_CheckBoxIndicator, &option, this);
+    QPainter painter(this);
+    painter.setRenderHint(QPainter::Antialiasing);
+    painter.setPen(QPen(checkColor, qMax<qreal>(1.5, indicator.width() / 7.0),
+                        Qt::SolidLine, Qt::RoundCap, Qt::RoundJoin));
+    const QPointF points[]{
+      {indicator.left() + indicator.width() * 0.22, indicator.top() + indicator.height() * 0.51},
+      {indicator.left() + indicator.width() * 0.43, indicator.top() + indicator.height() * 0.72},
+      {indicator.left() + indicator.width() * 0.79, indicator.top() + indicator.height() * 0.28},
+    };
+    painter.drawPolyline(points, 3);
+  }
+private:
+  static QColor contrastingMark(const QColor &accent) {
+    const auto linear = [](qreal value) {
+      return value <= 0.04045 ? value / 12.92 : std::pow((value + 0.055) / 1.055, 2.4);
+    };
+    const qreal luminance = 0.2126 * linear(accent.redF()) +
+                            0.7152 * linear(accent.greenF()) + 0.0722 * linear(accent.blueF());
+    return (luminance + 0.05) / 0.05 >= 1.05 / (luminance + 0.05) ? Qt::black : Qt::white;
+  }
+  const QColor checkColor;
+};
+
 class Prompt final : public QDialog {
 public:
   explicit Prompt(int fd, QWidget *parent = nullptr)
@@ -142,9 +183,9 @@ public:
     auto *content = new QVBoxLayout(body);
     content->setContentsMargins(0, 0, 0, 0);
     content->setSpacing(px(8));
-    auto *card = new QFrame(body);
-    card->setObjectName("keyCard");
-    auto *keyLayout = new QVBoxLayout(card);
+    keyCard = new QFrame(body);
+    keyCard->setObjectName("keyCard");
+    auto *keyLayout = new QVBoxLayout(keyCard);
     keyLayout->setContentsMargins(px(12), px(10), px(12), px(10));
     keyLayout->setSpacing(px(3));
     keyName = label({}, "key-name");
@@ -153,7 +194,7 @@ public:
     keyMetadata = label({}, "metadata");
     keyLayout->addWidget(keyName);
     keyLayout->addWidget(keyMetadata);
-    content->addWidget(card);
+    content->addWidget(keyCard);
 
     steps = new QWidget(body);
     auto *stepLayout = new QBoxLayout(QBoxLayout::LeftToRight, steps);
@@ -172,6 +213,54 @@ public:
     requestDetails = label({}, "request-details");
     content->addWidget(requestDetails);
     requestDetails->hide();
+    policyEditor = new QWidget(body);
+    policyEditor->setObjectName("policy-editor");
+    auto *policyLayout = new QVBoxLayout(policyEditor);
+    policyLayout->setContentsMargins(0, 0, 0, 0);
+    policyLayout->setSpacing(px(8));
+    inheritPolicy = new PolicyCheckBox(text(PromptI18n::Message::InheritSettings), theme.accent, policyEditor);
+    inheritPolicy->setObjectName("policy-inherit");
+    policyLayout->addWidget(inheritPolicy);
+    policyLayout->addWidget(label(text(PromptI18n::Message::DurationLabel), "policy-duration-label"));
+    lifetimePreset = new QComboBox(policyEditor);
+    lifetimePreset->setObjectName("policy-lifetime");
+    lifetimePreset->setAccessibleName(text(PromptI18n::Message::DurationLabel));
+    lifetimePreset->setSizePolicy(QSizePolicy::Ignored, QSizePolicy::Fixed);
+    for (int seconds : {0, 60, 300, 900, 1800, 3600, 14400, 28800, 86400})
+      lifetimePreset->addItem(duration(seconds), seconds);
+    lifetimePreset->addItem(text(PromptI18n::Message::CustomDuration), -1);
+    policyLayout->addWidget(lifetimePreset);
+    lifetimeCustom = new QSpinBox(policyEditor);
+    lifetimeCustom->setObjectName("policy-custom-seconds");
+    lifetimeCustom->setRange(1, 31536000);
+    lifetimeCustom->setSuffix(text(PromptI18n::Message::Seconds));
+    lifetimeCustom->setAccessibleName(text(PromptI18n::Message::DurationLabel));
+    lifetimeCustom->setKeyboardTracking(false);
+    lifetimeCustom->setSizePolicy(QSizePolicy::Ignored, QSizePolicy::Fixed);
+    policyLayout->addWidget(lifetimeCustom);
+    inheritSummary = label({}, "policy-inherited-duration");
+    policyLayout->addWidget(inheritSummary);
+    revokeOnSleep = new PolicyCheckBox(text(PromptI18n::Message::RevokeOnSleep), theme.accent, policyEditor);
+    revokeOnSleep->setObjectName("policy-sleep");
+    policyLayout->addWidget(revokeOnSleep);
+    // Only validated theme colors enter QSS. These controls edit policy inside
+    // the native helper; the untrusted caller cannot provide the saved value.
+    policyEditor->setStyleSheet(QStringLiteral(
+        "QComboBox, QSpinBox { background: %1; color: %2; border: 1px solid %3; "
+        "border-radius: %4px; padding: %5px; min-height: %6px; } "
+        "QComboBox:focus, QSpinBox:focus { border-color: %7; } "
+        "QComboBox:disabled, QSpinBox:disabled, QCheckBox:disabled { color: %8; } "
+        "QCheckBox { spacing: %5px; padding: %9px 0; } "
+        "QCheckBox::indicator { width: %10px; height: %10px; border: 1px solid %3; "
+        "border-radius: %9px; background: %1; } "
+        "QCheckBox::indicator:checked { background: %7; border-color: %7; }")
+        .arg(theme.well.name(), theme.foreground.name(), theme.border.name())
+        .arg(px(qBound(0, theme.radius, 24))).arg(px(7)).arg(px(16))
+        .arg(theme.accent.name(), theme.muted.name()).arg(px(3)).arg(px(12)));
+    content->addWidget(policyEditor);
+    policyEditor->hide();
+    connect(inheritPolicy, &QCheckBox::toggled, this, [this] { updatePolicyControls(); });
+    connect(lifetimePreset, &QComboBox::currentIndexChanged, this, [this] { updatePolicyControls(); });
     pass = secretField("passphrase", text(PromptI18n::Message::KeyPassphrase));
     confirm = secretField("confirmation", text(PromptI18n::Message::RepeatPassphrase));
     content->addWidget(pass);
@@ -254,10 +343,12 @@ private:
   bool initialized = false, armed = false, sent = false, finished = false;
   bool surfacePrepared = false, confirmationOnly = false, fingerprintMode = false;
   bool fingerprintQueued = false;
+  bool policyEditing = false;
   int progressRank = 0;
   QString progressPhase;
   QByteArray incoming;
-  QString operation, fullName;
+  QString operation, fullName, fingerprintIdentity, metadataDuration;
+  QFrame *keyCard;
   QLabel *title, *subtitle, *keyName, *keyMetadata, *requestDetails, *details, *status;
   QLabel *stepPassword, *stepFingerprint;
   QLineEdit *pass, *confirm;
@@ -265,6 +356,11 @@ private:
   QSocketNotifier *notifier;
   QScrollArea *scroll;
   QWidget *body, *steps, *statusRow;
+  QWidget *policyEditor;
+  QCheckBox *inheritPolicy, *revokeOnSleep;
+  QComboBox *lifetimePreset;
+  QSpinBox *lifetimeCustom;
+  QLabel *inheritSummary;
   BusyIndicator *progress;
   QVBoxLayout *layout;
   QBoxLayout *buttons;
@@ -327,6 +423,29 @@ private:
     stepLayout->setDirection(stackedSteps ? QBoxLayout::TopToBottom : QBoxLayout::LeftToRight);
     stepLayout->itemAt(1)->widget()->setVisible(!stackedSteps);
     keyName->setText(keyName->fontMetrics().elidedText(fullName, Qt::ElideMiddle, contentWidth - 2 * px(12)));
+    // A fingerprint is an unbroken token. QLabel's ordinary word wrapping can
+    // clip it, so wrap only its presentation; Details retains the exact string.
+    QString wrappedFingerprint, fingerprintLine;
+    const int fingerprintWidth = qMax(20, contentWidth - 2 * px(13));
+    QString fingerprintToken = fingerprintIdentity;
+    const auto metrics = keyMetadata->fontMetrics();
+    const int colon = fingerprintToken.indexOf(':');
+    if (colon >= 0 && metrics.horizontalAdvance(fingerprintToken) > fingerprintWidth &&
+        metrics.horizontalAdvance(fingerprintToken.mid(colon + 1)) <= fingerprintWidth) {
+      wrappedFingerprint = fingerprintToken.left(colon + 1) + '\n';
+      fingerprintToken = fingerprintToken.mid(colon + 1);
+    }
+    for (QChar character : fingerprintToken) {
+      if (!fingerprintLine.isEmpty() && keyMetadata->fontMetrics().horizontalAdvance(fingerprintLine + character) > fingerprintWidth) {
+        wrappedFingerprint += fingerprintLine + '\n';
+        fingerprintLine.clear();
+      }
+      fingerprintLine += character;
+    }
+    keyMetadata->setText(wrappedFingerprint + fingerprintLine + metadataDuration);
+    keyCard->layout()->invalidate();
+    keyCard->layout()->activate();
+    body->layout()->invalidate();
     body->layout()->activate();
     const int bodyHeight = body->layout()->totalHeightForWidth(body->width());
     int contentHeight = bodyHeight > 0 ? bodyHeight : body->sizeHint().height();
@@ -409,14 +528,14 @@ private:
       auto object = document.object();
       if (!initialized) {
         const auto op = object.value("operation").toString();
-        if (op != "sync" && op != "unlock" && op != "encrypt" && !confirmationOperation(op)) { finished = true; reject(); return; }
+        if (op != "sync" && op != "unlock" && op != "encrypt" && !confirmationOperation(op) && !policyOperation(op)) { finished = true; reject(); return; }
         initialized = true;
         if (!initialize(object)) { finished = true; reject(); return; }
       } else {
         const auto state = object.value("state").toString();
         if (state == "progress") {
           applyProgress(object.value("phase").toString());
-        } else if (state == "fingerprint" && sent && !finished && !confirmationOnly) {
+        } else if (state == "fingerprint" && sent && !finished && !confirmationOnly && !policyEditing) {
           // Legacy workers announced this before pam_authenticate; it does
           // not prove the sensor is ready to accept a finger.
           applyProgress(QStringLiteral("fingerprint_starting"));
@@ -425,7 +544,10 @@ private:
           clearSecrets();
           pass->hide(); confirm->hide();
           proceed->setEnabled(false);
-          setStatus(state == "completed" ? text(PromptI18n::Message::Done) : errorText(object.value("error_code").toString()));
+          policyEditor->setEnabled(false);
+          setStatus(state == "completed"
+              ? text(policyEditing ? PromptI18n::Message::ChangesSubmitted : PromptI18n::Message::Done)
+              : errorText(object.value("error_code").toString()));
           QTimer::singleShot(state == "completed" ? 150 : 2500, this, &QDialog::accept);
         }
         if (finished) notifier->setEnabled(false);
@@ -446,7 +568,7 @@ private:
     body->layout()->invalidate();
   }
   void applyProgress(const QString &phase) {
-    if (!sent || finished || confirmationOnly) return;
+    if (!sent || finished || confirmationOnly || policyEditing) return;
     int rank = 0;
     QString caption;
     const bool fingerprintStep = operation == "sync" || (operation == "unlock" && fingerprintMode);
@@ -499,6 +621,55 @@ private:
   static bool confirmationOperation(const QString &op) {
     return op == "rules.key" || op == "unbind";
   }
+  static bool policyOperation(const QString &op) {
+    return op == "settings.global" || op == "settings.key";
+  }
+  static bool validLifetime(const QJsonValue &value, int *seconds) {
+    if (!value.isDouble()) return false;
+    *seconds = value.toInt(-1);
+    return *seconds >= 0 && *seconds <= 31536000 && value.toDouble() == *seconds;
+  }
+  void updatePolicyControls() {
+    if (!policyEditing) return;
+    const bool inherited = operation == "settings.key" && inheritPolicy->isChecked();
+    lifetimePreset->setEnabled(!inherited);
+    lifetimeCustom->setEnabled(!inherited);
+    lifetimeCustom->setVisible(lifetimePreset->currentData().toInt() < 0 && !inherited);
+    inheritSummary->setVisible(inherited);
+    fitContent();
+  }
+  bool initializePolicy(const QJsonObject &job) {
+    if (!job.value("value").isObject()) return false;
+    const auto value = job.value("value").toObject();
+    const bool global = operation == "settings.global";
+    int seconds = 0, generalSeconds = 0;
+    if (!validLifetime(value.value("lifetime_seconds"), &seconds)) return false;
+    if (global) {
+      if (value.size() != 2 || !value.value("revoke_on_sleep").isBool() ||
+          !job.value("key").isNull()) return false;
+      fullName = text(PromptI18n::Message::GeneralSettings);
+      subtitle->setText(text(PromptI18n::Message::GeneralSettings));
+      keyCard->hide();
+      revokeOnSleep->setChecked(value.value("revoke_on_sleep").toBool());
+    } else {
+      if (value.size() != 3 || !value.value("inherits").isBool() ||
+          !validLifetime(value.value("global_lifetime_seconds"), &generalSeconds) ||
+          !job.value("key").isObject() || fullName.isEmpty()) return false;
+      subtitle->setText(text(PromptI18n::Message::KeySettings));
+      inheritPolicy->setChecked(value.value("inherits").toBool());
+      inheritSummary->setText(text(PromptI18n::Message::GeneralLifetime) + duration(generalSeconds));
+    }
+    inheritPolicy->setVisible(!global);
+    revokeOnSleep->setVisible(global);
+    const int index = lifetimePreset->findData(seconds);
+    lifetimePreset->setCurrentIndex(index >= 0 ? index : lifetimePreset->count() - 1);
+    lifetimeCustom->setValue(seconds ? seconds : 1800);
+    policyEditor->show();
+    proceed->setText(text(PromptI18n::Message::Save));
+    setStatus(text(PromptI18n::Message::SettingsExplanation));
+    updatePolicyControls();
+    return true;
+  }
   bool initializeConfirmation(const QJsonObject &job) {
     const auto value = job.value("value");
     QString target;
@@ -533,15 +704,20 @@ private:
   bool initialize(const QJsonObject &job) {
     operation = job.value("operation").toString();
     confirmationOnly = confirmationOperation(operation);
+    policyEditing = policyOperation(operation);
     const auto key = job.value("key").toObject();
     subtitle->setText(operation == "sync" ? text(PromptI18n::Message::FingerprintBinding) : operation == "encrypt" ? text(PromptI18n::Message::SetPassphrase) : text(PromptI18n::Message::SshKeyAccess));
     fullName = bounded(key.value("name").toString(), 256);
-    keyMetadata->hide();
+    fingerprintIdentity = bounded(key.value("fingerprint").toString(), 128);
+    if (operation == "unlock") metadataDuration = text(PromptI18n::Message::AccessDuration) +
+        duration(job.value("rules").toObject().value("lifetime_seconds").toInt());
+    keyMetadata->setText(fingerprintIdentity + metadataDuration);
+    keyMetadata->setVisible(!fingerprintIdentity.isEmpty() || !metadataDuration.isEmpty());
     const QString caller = bounded(job.value("caller").toString(), 256);
     const QString executable = caller.section(QStringLiteral(" (PID "), 0, 0);
-    const bool panel = executable == QStringLiteral("/usr/lib/ssh-keys/panel-client");
-    const QString callerName = panel ? QStringLiteral("KeyController")
-        : executable.startsWith('/') ? executable.section('/', -1) : caller;
+    // The transport executable does not attest that a person clicked the bar.
+    // Report it literally instead of promoting panel-client to trusted UI intent.
+    const QString callerName = executable.startsWith('/') ? executable.section('/', -1) : caller;
     details->setText(bounded(key.value("fingerprint").toString(), 128) + "\n" +
                      bounded(key.value("path").toString(), 2048) +
                      (operation == "unlock" ? text(PromptI18n::Message::AccessDuration) +
@@ -556,7 +732,11 @@ private:
     subtitle->setVisible(operation != "unlock");
     steps->setVisible(operation == "sync");
     stepFingerprint->setEnabled(false);
-    if (confirmationOnly) {
+    if (policyEditing) {
+      if (!initializePolicy(job)) return false;
+      requestDetails->setText(text(PromptI18n::Message::Request) + callerName);
+      requestDetails->show();
+    } else if (confirmationOnly) {
       if (!initializeConfirmation(job)) return false;
     } else if (operation == "encrypt") {
       proceed->setText(text(PromptI18n::Message::Continue));
@@ -567,7 +747,7 @@ private:
     } else {
       QString request = text(PromptI18n::Message::Request) + callerName;
       const QString reason = bounded(job.value("reason").toString(), 512).trimmed();
-      if (!reason.isEmpty() && !(panel && reason == QStringLiteral("Запрос из панели KeyController")))
+      if (!reason.isEmpty())
         request += "\n" + reason;
       requestDetails->setText(request);
       requestDetails->show();
@@ -585,6 +765,25 @@ private:
   }
   void submit() {
     if (sent || finished || !initialized) return;
+    if (policyEditing) {
+      lifetimeCustom->interpretText();
+      const int seconds = lifetimePreset->currentData().toInt() < 0
+          ? lifetimeCustom->value() : lifetimePreset->currentData().toInt();
+      QJsonObject value{{"lifetime_seconds", seconds}};
+      if (operation == "settings.global") value.insert("revoke_on_sleep", revokeOnSleep->isChecked());
+      else value.insert("inherits", inheritPolicy->isChecked());
+      if (!send(QJsonObject{{"consent", true}, {"mode", "settings"}, {"passphrase", ""},
+                           {"confirmation", ""}, {"value", value}})) {
+        finished = true; reject(); return;
+      }
+      sent = true;
+      clearSecrets();
+      policyEditor->setEnabled(false);
+      proceed->setEnabled(false);
+      setStatus(text(PromptI18n::Message::Working), true);
+      fitContent();
+      return;
+    }
     if (confirmationOnly) {
       if (!send(QJsonObject{{"consent", true}, {"mode", "confirm"}, {"passphrase", ""}, {"confirmation", ""}})) {
         finished = true; reject(); return;

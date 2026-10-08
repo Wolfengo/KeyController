@@ -7,6 +7,14 @@ function language(localeName) {
 }
 
 var english = {
+  "Изменить правила доступа": "Edit access rules",
+  "Правила изменились. Откройте настройки снова.": "The rules changed. Open settings again.",
+  "Найти SSH-ключи": "Find SSH keys",
+  "Поиск в каталоге и его вложенных папках:": "Search this directory and its subdirectories:",
+  "Файлы будут прочитаны для определения ключей. Поиск не меняет файлы и не открывает доступ к ключам. Последующие обновления запускаются вручную.": "Files will be read to identify SSH keys. Searching does not change files or unlock keys. Later refreshes are started manually.",
+  "Поиск…": "Searching…",
+  "Сканировать": "Scan",
+  "Позже": "Later",
   "ключ": "key",
   "ключа": "keys",
   "ключей": "keys",

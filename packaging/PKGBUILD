@@ -1,6 +1,6 @@
 pkgname=keycontroller
-pkgver=0.1.0
-pkgrel=24
+pkgver=0.1.1
+pkgrel=1
 pkgdesc='KeyController for Omarchy: SSH key widget, secure prompt and OpenSSH agent'
 url='https://github.com/Wolfengo/KeyController'
 arch=('x86_64' 'aarch64')
@@ -36,6 +36,8 @@ check() {
   python tests/dependencies.py
   python tests/package-brand.py
   python tests/package-export.py
+  python tests/reproducible-export.py
+  python tests/reproducible-release.py target/release/ssh-keysd
 }
 
 package() {

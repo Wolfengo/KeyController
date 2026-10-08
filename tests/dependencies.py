@@ -850,15 +850,15 @@ case "$1" in
             [ -x '{python}' ] && exit 0
             printf 'python\\n'; exit 127
         fi
-        if [ "$2" = 'keycontroller>=0.1.0-24' ]; then
-            {'exit 0' if helper == 'installed' else "printf 'keycontroller>=0.1.0-24\\n'; exit 127"}
+        if [ "$2" = 'keycontroller>=0.1.1-1' ]; then
+            {'exit 0' if helper == 'installed' else "printf 'keycontroller>=0.1.1-1\\n'; exit 127"}
         fi
         exit 2 ;;
     -Si)
         if [ "$2" = python ]; then
             printf 'Repository : extra\\nName : python\\nVersion : 3.14.0-1\\n'
         elif [ "$2" = keycontroller ]; then
-            {'exit 1' if helper == 'absent' else "printf 'Repository : omarchy\\nName : keycontroller\\nVersion : 0.1.0-24\\n'"}
+            {'exit 1' if helper == 'absent' else "printf 'Repository : omarchy\\nName : keycontroller\\nVersion : 0.1.1-1\\n'"}
         else exit 2; fi ;;
     -S)
         [ {outcome} = 0 ] || exit {outcome}

@@ -7,8 +7,8 @@ fn call(mut cmd: Command) -> ssh_keys::Result<serde_json::Value> {
     match cmd.action.as_str() {
         "keys.list" | "keys.status" | "keys.unlock" => client::call(&cmd),
         "capabilities" | "panel.list" | "scan" | "requests.status" | "requests.cancel" | "mode"
-        | "revoke" | "rules.global" => client::call_desktop(&cmd),
-        "sync" | "encrypt" | "rules.key" | "unbind" => {
+        | "revoke" => client::call_desktop(&cmd),
+        "sync" | "encrypt" | "rules.key" | "unbind" | "settings.global" | "settings.key" => {
             // These are shortcuts for opening a specific native dialog. Its
             // private consent channel, never this launch command, grants the
             // requested change. Unknown fields cannot carry self-approval.

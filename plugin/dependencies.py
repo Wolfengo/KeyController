@@ -19,7 +19,7 @@ import subprocess
 import sys
 
 
-HELPER_REQUIREMENT = "keycontroller>=0.1.0-24"
+HELPER_REQUIREMENT = "keycontroller>=0.1.1-1"
 REQUIREMENTS = (
     HELPER_REQUIREMENT, "openssh>=10.5p1", "qt6-base", "qt6-svg",
     "qt6-wayland", "layer-shell-qt>=6.6", "systemd", "pam", "python", "polkit",

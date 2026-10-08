@@ -15,7 +15,7 @@ FLOCK=/usr/bin/flock
 STAT=/usr/bin/stat
 ENV=/usr/bin/env
 VERCMP=/usr/bin/vercmp
-HELPER_REQUIREMENT='keycontroller>=0.1.0-24'
+HELPER_REQUIREMENT='keycontroller>=0.1.1-1'
 
 case "$#:$1:${2-}" in
     1:--install:) mode=install ;;
