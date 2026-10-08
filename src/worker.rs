@@ -47,6 +47,20 @@ struct Answer {
     mode: String,
     passphrase: String,
     confirmation: String,
+    #[serde(default)]
+    #[zeroize(skip)]
+    value: Value,
+}
+fn policy_answer(operation: &str, answer: &Answer) -> Result<Value> {
+    if !answer.consent {
+        return Err(Error("cancelled"));
+    }
+    if answer.mode != "settings" || !answer.passphrase.is_empty() || !answer.confirmation.is_empty()
+    {
+        return Err(Error("invalid_confirmation"));
+    }
+    crate::state::validate_policy_edit(operation, &answer.value)?;
+    Ok(json!({"ok":true,"confirmed":true,"value":&answer.value}))
 }
 pub fn credential_path(user: &User, id: &str) -> std::path::PathBuf {
     user.state_dir()
@@ -434,7 +448,14 @@ pub fn run(job: Job) -> Result<Value> {
     // Reject retired/unknown jobs before display setup or any child process.
     if !matches!(
         job.operation.as_str(),
-        "scan" | "sync" | "unlock" | "encrypt" | "rules.key" | "unbind"
+        "scan"
+            | "sync"
+            | "unlock"
+            | "encrypt"
+            | "rules.key"
+            | "unbind"
+            | "settings.global"
+            | "settings.key"
     ) {
         return Err(Error("invalid_operation"));
     }
@@ -487,6 +508,12 @@ pub fn run(job: Job) -> Result<Value> {
         }
     });
     let result = (|| -> Result<Value> {
+        if matches!(job.operation.as_str(), "settings.global" | "settings.key") {
+            return policy_answer(&job.operation, &answer);
+        }
+        if !answer.value.is_null() {
+            return Err(Error("invalid_confirmation"));
+        }
         if matches!(job.operation.as_str(), "rules.key" | "unbind") {
             if answer.mode != "confirm"
                 || !answer.passphrase.is_empty()
@@ -644,6 +671,43 @@ mod tests {
     }
     fn user() -> User {
         User::get(unsafe { libc::getuid() }).unwrap()
+    }
+
+    #[test]
+    fn private_policy_answer_requires_editor_consent_and_contains_no_secret_fields() {
+        for operation in ["settings.global", "settings.key"] {
+            let value = if operation == "settings.global" {
+                json!({"lifetime_seconds":60,"revoke_on_sleep":true})
+            } else {
+                json!({"inherits":true,"lifetime_seconds":60})
+            };
+            let original = json!({"consent":true,"mode":"settings","passphrase":"","confirmation":"","value":value});
+            let answer: Answer = serde_json::from_value(original.clone()).unwrap();
+            assert_eq!(
+                policy_answer(operation, &answer).unwrap(),
+                json!({"ok":true,"confirmed":true,"value":value})
+            );
+            for (field, replacement) in [
+                ("consent", json!(false)),
+                ("mode", json!("confirm")),
+                ("passphrase", json!("disposable-answer-sentinel")),
+                ("confirmation", json!("disposable-answer-sentinel")),
+                ("value", Value::Null),
+                ("value", json!({"lifetime_seconds":0})),
+            ] {
+                let mut edited = original.clone();
+                edited[field] = replacement;
+                let answer: Answer = serde_json::from_value(edited).unwrap();
+                assert!(policy_answer(operation, &answer).is_err());
+            }
+            let mut edited = original.clone();
+            edited["value"]["passphrase"] = json!("disposable-answer-sentinel");
+            let answer: Answer = serde_json::from_value(edited).unwrap();
+            assert!(policy_answer(operation, &answer).is_err());
+            let mut edited = original;
+            edited["confirmed"] = json!(true);
+            assert!(serde_json::from_value::<Answer>(edited).is_err());
+        }
     }
 
     #[test]

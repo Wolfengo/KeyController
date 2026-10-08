@@ -83,6 +83,8 @@ ShellRoot {
       response.global_rules = {lifetime_seconds:0, revoke_on_sleep:false}
       response.active_request = scenario >= 0 && cases[scenario].active && !accepted ? "fixture-pending-unlock" : null
       response.scanned = true
+      response.scan_root = "/test/.ssh"
+      response.scan_requires_consent = false
       response.session_available = true
       if (accepted) sawEmptyList = true
     } else if (action === "mode" || action === "revoke") {

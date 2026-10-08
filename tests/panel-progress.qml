@@ -74,7 +74,6 @@ ShellRoot {
     id: panel
     manageIpc: false
     rows: [test.fixture]
-    firstScanRequested: true
     function refresh() {}
     function startCall(action, key, value, request) {
       test.calls.push(action)
@@ -95,6 +94,8 @@ ShellRoot {
       } else if (action === "panel.list") {
         result.keys = [test.fixture]
         result.scanned = true
+        result.scan_root = "/test/.ssh"
+        result.scan_requires_consent = false
         result.ui_language = "ru"
         result.global_rules = {lifetime_seconds:60, revoke_on_sleep:false}
       } else test.check(false, "unexpected operation: " + action)

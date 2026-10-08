@@ -35,12 +35,14 @@ Panel {
   onActiveRequestChanged: if (!activeRequest) activeRequestKey = ""
   property string message: ""
   property bool showCandidates: false
-  property bool firstScanRequested: false
+  property bool inventoryReady: !manageIpc
+  property bool scanned: !manageIpc
+  property bool discoveryApproved: !manageIpc
+  property string scanRoot: ""
+  readonly property bool needsInitialScan: inventoryReady && !discoveryApproved
   property string settingsKey: ""
   property var settingsRow: null
   property bool settingsOpen: false
-  property int settingsRevision: 0
-  property int globalSaveRevision: -1
   property bool detailsExpanded: false
   property double clockSeconds: Math.floor(Date.now() / 1000)
   property string currentAction: ""
@@ -126,6 +128,11 @@ Panel {
   }
   function updateRows(nextRows) {
     if (JSON.stringify(rows) !== JSON.stringify(nextRows)) rows = nextRows
+    if (settingsRow) {
+      var current = nextRows.find(function(row) { return row.path === settingsRow.path })
+      if (current) settingsRow = current
+      else { settingsOpen = false; settingsRow = null; settingsKey = "" }
+    }
   }
   function updateKeyStatus(reply) {
     // Access and preferences belong to the fingerprint; file metadata belongs
@@ -142,10 +149,6 @@ Panel {
       return next
     })
     updateRows(nextRows)
-    if (settingsRow) {
-      var current = nextRows.find(function(row) { return row.path === settingsRow.path })
-      if (current) settingsRow = current
-    }
     if (reply.operation === "revoke" && !reply.busy && activeRequestKey === reply.key_id) activeRequest = ""
   }
   function validGlobalRules(rules) {
@@ -155,30 +158,30 @@ Panel {
   }
   function receiveGlobalRules(rules) {
     if (!validGlobalRules(rules)) throw new Error("Invalid global settings metadata")
-    var first = !globalRulesReady
     if (JSON.stringify(globalRules) !== JSON.stringify(rules)) globalRules = rules
     globalRulesReady = true
-    // A form opened before the first reply cannot edit defaults. Fill it once
-    // with authoritative metadata; later polling must preserve the user's draft.
-    if (first && settingsOpen && !settingsRow) {
-      lifetime.value = rules.lifetime_seconds
-      sleepRevoke.checked = rules.revoke_on_sleep
-    }
   }
-  function applyGlobalRules(reply) {
-    var rules = reply.global_rules
-    var partial = reply.state === "partial" && reply.error_code === "settings_durability_unknown"
-    if ((!partial && (reply.state !== "ready" || reply.error_code)) || reply.operation !== "rules.global" || reply.request_id !== null
-        || !validGlobalRules(rules))
-      throw new Error("Invalid global settings response")
-    receiveGlobalRules(rules)
-    // Per-key lifetime rules govern future loads. Do not change current state, known expiry,
-    // biometric preferences, or a key's explicitly configured rules.
-    updateRows(rows.map(function(row) {
-      return row.inherits ? Object.assign({}, row, {rules: {lifetime_seconds: rules.lifetime_seconds}}) : row
-    }))
-    // A reply to an older form must not dismiss another draft opened meanwhile.
-    if (!partial && !settingsRow && settingsRevision === globalSaveRevision) settingsOpen = false
+  function receiveScanStatus(reply) {
+    if (typeof reply.scanned !== "boolean" || typeof reply.scan_requires_consent !== "boolean" || typeof reply.scan_root !== "string"
+        || !reply.scan_root.startsWith("/") || reply.scan_root.length > 4096
+        || /[\x00-\x1f\x7f]/.test(reply.scan_root))
+      throw new Error("Invalid scan metadata")
+    scanRoot = reply.scan_root
+    scanned = reply.scanned
+    discoveryApproved = !reply.scan_requires_consent
+    inventoryReady = true
+  }
+  function scanKeys() {
+    if (!inventoryReady || !scanRoot || activeRequest || actionBusy) return false
+    // First use is reachable only through the explicit inline consent button.
+    // The helper persists discovery approval after a successful refresh.
+    return call("scan")
+  }
+  function editRules(row) {
+    if (!globalRulesReady || activeRequest || actionBusy) return false
+    // The native editor reads and commits authoritative values over its
+    // private channel. QML sends no policy values or approval capability.
+    return call(row ? "settings.key" : "settings.global", row ? row.key_id : null, null)
   }
   function reconcileVisibleRows() {
     // Replacing a JS-array Repeater model destroys every row on each poll.
@@ -205,12 +208,9 @@ Panel {
   onVisibleRowsChanged: reconcileVisibleRows()
   ListModel { id: visibleKeys; dynamicRoles: true }
   function settingsFor(row) {
-    settingsRevision++
+    if (!row) return editRules(null)
     settingsRow = row
-    settingsKey = row ? row.key_id : ""
-    inherit.checked = row ? row.inherits : false
-    lifetime.value = row ? row.rules.lifetime_seconds : globalRules.lifetime_seconds
-    if (!row) sleepRevoke.checked = globalRules.revoke_on_sleep === true
+    settingsKey = row.key_id
     detailsExpanded = !!row && (!!row.unavailable || row.unencrypted_copies.length > 0)
     settingsOpen = true
   }
@@ -269,6 +269,7 @@ Panel {
       request_not_found: root.t("Запрос больше не найден"), not_bound: root.t("Сначала привяжите отпечаток"), empty_passphrase: root.t("Введите непустой пароль"),
       confirmation_mismatch: root.t("Пароли не совпадают"), operation_failed: root.t("Не удалось завершить операцию"), service_timeout: root.t("Помощник не ответил вовремя"),
       settings_durability_unknown: root.t("Настройки применены, но сохранность после сбоя не подтверждена."),
+      settings_changed: root.t("Правила изменились. Откройте настройки снова."),
       sleep_in_progress: root.t("Идёт подготовка ко сну. Повторите после пробуждения."),
       api_mismatch: root.t("Несовместимые версии виджета и системного помощника")
     }
@@ -300,16 +301,9 @@ Panel {
           if (reply.api_version !== 1) { root.message = root.t("Несовместимая версия помощника"); return }
           if (reply.error_code) root.message = root.responseDescription(reply)
           else if (["synced", "encrypted", "cancelled", "denied", "expired", "partial"].indexOf(reply.state) !== -1) root.message = root.responseDescription(reply)
-          if (root.currentAction === "rules.global") {
-            if (!reply.error_code || (reply.state === "partial" && reply.error_code === "settings_durability_unknown")) {
-              root.applyGlobalRules(reply)
-              if (!reply.error_code) root.message = ""
-              root.defer("panel.list")
-            }
-            return
-          }
           if (reply.keys) {
             root.receiveLanguage(reply.ui_language)
+            root.receiveScanStatus(reply)
             root.receiveGlobalRules(reply.global_rules)
             root.updateRows(reply.keys)
             // A completed worker disappears from panel.list before its result
@@ -319,17 +313,13 @@ Panel {
               var activeRow = reply.keys.find(function(row) { return row.request_id === root.activeRequest })
               if (activeRow) root.activeRequestKey = activeRow.key_id
             }
-            if (!reply.scanned && !root.firstScanRequested && !root.activeRequest) {
-              root.firstScanRequested = true
-              root.defer("scan")
-            }
           }
           if (reply.state === "pending") {
             if (!reply.request_id) throw new Error("Missing request ID")
             root.activeRequest = reply.request_id
             if (reply.key_id) root.activeRequestKey = reply.key_id
             // The layer-shell popup otherwise covers the separate Qt window.
-            if (["keys.unlock", "sync", "encrypt", "rules.key", "unbind"].indexOf(root.currentAction) !== -1) root.close()
+            if (["keys.unlock", "sync", "encrypt", "rules.key", "settings.global", "settings.key", "unbind"].indexOf(root.currentAction) !== -1) root.close()
           }
           else if (root.currentAction === "requests.status" || root.currentAction === "requests.cancel") {
             root.activeRequest = ""
@@ -482,7 +472,7 @@ Panel {
           Text {
             objectName: "ssh-keys-summary"
             Layout.fillWidth: true
-            text: !root.dependenciesReady ? root.t("Подготовка к работе") : root.settingsOpen ? (root.settingsRow ? root.t("Настройки ключа") : root.t("Общие настройки"))
+            text: !root.dependenciesReady ? root.t("Подготовка к работе") : root.needsInitialScan ? root.t("Найти SSH-ключи") : root.settingsOpen ? root.t("О ключе")
               : root.showCandidates ? root.t("Найдены в ~/.ssh")
               : KeyLocale.keySummary(root.uiLanguage, root.visibleRows.length, root.visibleRows.filter(function(k) { return k.state === "unlocked" }).length)
             color: Util.alpha(Color.popups.text, 0.65)
@@ -492,11 +482,11 @@ Panel {
           }
         }
         Row {
-          visible: root.dependenciesReady && !root.settingsOpen
+          visible: root.dependenciesReady && root.inventoryReady && !root.needsInitialScan && !root.settingsOpen
           spacing: Style.space(4)
-          KeyAction { implicitWidth: Style.space(30); implicitHeight: Style.space(32); bordered: false; iconText: "\uf021"; tooltipText: root.t("Обновить"); enabled: !root.activeRequest && !root.actionBusy; onClicked: root.call("scan") }
+          KeyAction { implicitWidth: Style.space(30); implicitHeight: Style.space(32); bordered: false; iconText: "\uf021"; tooltipText: root.t("Обновить"); enabled: !root.activeRequest && !root.actionBusy; onClicked: root.scanKeys() }
           KeyAction { implicitWidth: Style.space(30); implicitHeight: Style.space(32); bordered: false; iconText: "+"; selected: root.showCandidates; tooltipText: root.t("Добавить ключ"); onClicked: root.showCandidates = !root.showCandidates }
-          KeyAction { implicitWidth: Style.space(30); implicitHeight: Style.space(32); bordered: false; iconText: "\uf013"; tooltipText: root.t("Настройки"); onClicked: root.settingsFor(null) }
+          KeyAction { implicitWidth: Style.space(30); implicitHeight: Style.space(32); bordered: false; iconText: "\uf013"; tooltipText: root.t("Настройки"); enabled: root.globalRulesReady && !root.activeRequest && !root.actionBusy; onClicked: root.editRules(null) }
         }
       }
 
@@ -546,6 +536,69 @@ Panel {
               if (root.dependenciesReady && root.opened) root.refresh()
             })
           }
+          BorderSurface {
+            objectName: "ssh-keys-first-scan"
+            visible: root.dependenciesReady && root.needsInitialScan
+            width: parent.width
+            implicitHeight: discovery.implicitHeight + Style.space(30)
+            radius: Style.cornerRadius
+            color: "transparent"
+            borderSpec: Border.flat(Util.alpha(Color.popups.text, 0.12), Style.space(1))
+            ColumnLayout {
+              id: discovery
+              anchors.left: parent.left; anchors.right: parent.right; anchors.top: parent.top
+              anchors.margins: Style.space(15)
+              spacing: Style.space(14)
+              Text {
+                text: root.t("Найти SSH-ключи")
+                color: Color.popups.text
+                font.family: Style.font.family
+                font.pixelSize: Style.font.title
+                font.weight: Font.DemiBold
+              }
+              Text {
+                text: root.t("Поиск в каталоге и его вложенных папках:")
+                Layout.fillWidth: true
+                wrapMode: Text.Wrap
+                color: Util.alpha(Color.popups.text, 0.7)
+                font.family: Style.font.family
+                font.pixelSize: Style.font.bodySmall
+              }
+              Text {
+                objectName: "ssh-keys-scan-root"
+                text: root.scanRoot
+                textFormat: Text.PlainText
+                Layout.fillWidth: true
+                wrapMode: Text.WrapAnywhere
+                color: Color.popups.text
+                font.family: Style.font.family
+                font.pixelSize: Style.font.body
+              }
+              Text {
+                text: root.t("Файлы будут прочитаны для определения ключей. Поиск не меняет файлы и не открывает доступ к ключам. Последующие обновления запускаются вручную.")
+                Layout.fillWidth: true
+                wrapMode: Text.Wrap
+                color: Util.alpha(Color.popups.text, 0.65)
+                font.family: Style.font.family
+                font.pixelSize: Style.font.bodySmall
+              }
+              KeyAction {
+                objectName: "ssh-keys-confirm-scan"
+                Layout.fillWidth: true
+                text: root.submittingAction === "scan" || root.activeRequest ? root.t("Поиск…") : root.t("Сканировать")
+                iconText: "\uf002"
+                busy: root.submittingAction === "scan" || root.activeRequest !== ""
+                enabled: !root.actionBusy && !root.activeRequest && root.scanRoot !== ""
+                onClicked: root.scanKeys()
+              }
+              KeyAction {
+                objectName: "ssh-keys-defer-scan"
+                text: root.t("Позже")
+                bordered: false
+                onClicked: root.close()
+              }
+            }
+          }
           ColumnLayout {
             visible: root.dependenciesReady && root.settingsOpen
             width: parent.width
@@ -561,112 +614,23 @@ Panel {
                 anchors.left: parent.left; anchors.right: parent.right; anchors.top: parent.top
                 anchors.margins: Style.space(15)
                 spacing: Style.space(14)
-                KeyAction {
-                  id: inherit
-                  objectName: "ssh-key-inherit"
-                  property bool checked: false
-                  property string label: root.t("Общий срок")
-                  visible: !!root.settingsRow
-                  Layout.fillWidth: true
-                  implicitHeight: Style.space(44)
-                  bordered: false
-                  tooltipText: root.t("Наследовать общий срок доступа")
-                  Accessible.role: Accessible.CheckBox
-                  Accessible.checked: checked
-                  onClicked: {
-                    checked = !checked
-                    if (checked) lifetime.value = root.globalRules.lifetime_seconds
-                  }
-                  RowLayout {
-                    anchors.fill: parent
-                    spacing: Style.space(12)
-                    ColumnLayout {
-                      Layout.fillWidth: true
-                      spacing: Style.space(3)
-                      Text { text: inherit.label; color: Color.popups.text; font.family: Style.font.family; font.pixelSize: Style.font.body }
-                      Text { text: root.t("Сейчас ") + root.durationLabel(root.globalRules.lifetime_seconds); color: Util.alpha(Color.popups.text, 0.6); font.family: Style.font.family; font.pixelSize: Style.font.caption }
-                    }
-                    ToggleSwitch {
-                      checked: inherit.checked
-                      interactive: false
-                      cursorRing: false
-                      trackHeight: Style.space(19)
-                      trackWidth: Style.space(33)
-                      knobSize: Style.space(13)
-                      foreground: Color.popups.text
-                    }
-                  }
-                }
-                PanelSeparator { visible: !!root.settingsRow; Layout.fillWidth: true; foreground: Color.popups.text }
-                Text { text: root.t("Срок доступа"); color: Util.alpha(Color.popups.text, 0.65); font.family: Style.font.family; font.pixelSize: Style.font.body }
-                KeyDuration {
-                  id: lifetime
-                  uiLanguage: root.uiLanguage
-                  objectName: "ssh-key-lifetime"
-                  Layout.fillWidth: true
-                  enabled: root.settingsRow ? !inherit.checked : root.globalRulesReady && root.submittingAction !== "rules.global"
-                }
+                Text { text: root.t("Срок доступа"); color: Util.alpha(Color.popups.text, 0.65); font.family: Style.font.family; font.pixelSize: Style.font.bodySmall }
                 Text {
-                  text: root.t("Применится при следующей разблокировке")
+                  objectName: "ssh-key-policy-summary"
+                  text: root.settingsRow ? root.durationLabel(root.settingsRow.rules.lifetime_seconds)
+                    + (root.settingsRow.inherits ? " · " + root.t("Общий срок") : "") : ""
                   Layout.fillWidth: true
                   wrapMode: Text.WordWrap
-                  color: Util.alpha(Color.popups.text, 0.55)
+                  color: Color.popups.text
                   font.family: Style.font.family
-                  font.pixelSize: Style.font.caption
+                  font.pixelSize: Style.font.title
                 }
-                PanelSeparator { visible: !root.settingsRow; Layout.fillWidth: true; foreground: Color.popups.text }
                 KeyAction {
-                  id: sleepRevoke
-                  objectName: "ssh-keys-revoke-on-sleep"
-                  property bool checked: false
-                  property string label: root.t("Отзывать перед сном")
-                  visible: !root.settingsRow
+                  objectName: "ssh-key-edit-rules"
+                  text: root.t("Изменить правила доступа")
                   Layout.fillWidth: true
-                  implicitHeight: Style.space(36)
-                  bordered: false
-                  enabled: root.globalRulesReady && root.submittingAction !== "rules.global"
-                  tooltipText: root.t("Отзывать все ключи управляемого SSH-агента перед сном")
-                  Accessible.role: Accessible.CheckBox
-                  Accessible.checked: checked
-                  onClicked: if (enabled) checked = !checked
-                  RowLayout {
-                    anchors.fill: parent
-                    spacing: Style.space(12)
-                    Text {
-                      Layout.fillWidth: true
-                      text: sleepRevoke.label
-                      color: Color.popups.text
-                      font.family: Style.font.family
-                      font.pixelSize: Style.font.body
-                    }
-                    ToggleSwitch {
-                      checked: sleepRevoke.checked
-                      interactive: false
-                      cursorRing: false
-                      trackHeight: Style.space(19)
-                      trackWidth: Style.space(33)
-                      knobSize: Style.space(13)
-                      foreground: Color.popups.text
-                    }
-                  }
-                }
-              }
-            }
-            KeyAction {
-              objectName: "ssh-key-save-rules"
-              Layout.fillWidth: true
-              text: !root.settingsRow && root.submittingAction === "rules.global" ? root.t("Сохранение…") : root.t("Сохранить")
-              selected: true
-              enabled: !root.actionBusy && (!!root.settingsRow || root.globalRulesReady)
-              onClicked: {
-                if (!root.settingsRow && !root.globalRulesReady) return
-                var rules = {lifetime_seconds: lifetime.value}
-                if (root.settingsRow) {
-                  if (root.call("rules.key", root.settingsKey, inherit.checked ? null : rules)) root.settingsOpen = false
-                } else {
-                  rules.revoke_on_sleep = sleepRevoke.checked
-                  var revision = root.settingsRevision
-                  if (root.call("rules.global", root.settingsKey, rules)) root.globalSaveRevision = revision
+                  enabled: root.globalRulesReady && !root.activeRequest && !root.actionBusy
+                  onClicked: root.editRules(root.settingsRow)
                 }
               }
             }
@@ -716,7 +680,7 @@ Panel {
             }
           }
           BorderSurface {
-            visible: root.dependenciesReady && !root.settingsOpen
+            visible: root.dependenciesReady && root.inventoryReady && !root.needsInitialScan && !root.settingsOpen
             width: parent.width
             implicitHeight: list.implicitHeight + Style.space(16)
             radius: Style.cornerRadius
@@ -761,6 +725,22 @@ Panel {
                         font.family: Style.font.family
                         font.pixelSize: Style.font.title
                         font.weight: Font.DemiBold
+                        objectName: "ssh-key-details"
+                        activeFocusOnTab: true
+                        Accessible.role: Accessible.Button
+                        Accessible.name: root.t("О ключе") + " · " + modelData.name
+                        Accessible.onPressAction: root.settingsFor(modelData)
+                        Keys.onReturnPressed: root.settingsFor(modelData)
+                        Keys.onSpacePressed: root.settingsFor(modelData)
+                        Controls.ToolTip.visible: detailsMouse.containsMouse
+                        Controls.ToolTip.text: root.t("Показать путь, отпечаток и состояние ключа")
+                        MouseArea {
+                          id: detailsMouse
+                          anchors.fill: parent
+                          hoverEnabled: true
+                          cursorShape: Qt.PointingHandCursor
+                          onClicked: root.settingsFor(modelData)
+                        }
                       }
                       KeyAction {
                         visible: modelData.unavailable || modelData.unencrypted_copies.length > 0
@@ -853,9 +833,11 @@ Panel {
                         implicitWidth: Style.space(28)
                         bordered: false
                         iconText: "\uf013"
-                        tooltipText: root.t("Сведения и настройки")
+                        tooltipText: root.t("Настройки ключа")
                         foreground: Util.alpha(Color.popups.text, 0.7)
-                        onClicked: root.settingsFor(modelData)
+                        objectName: "ssh-key-edit-settings"
+                        enabled: root.globalRulesReady && !root.activeRequest && !root.actionBusy
+                        onClicked: root.editRules(modelData)
                       }
                     }
                   }
@@ -876,7 +858,7 @@ Panel {
         }
       }
       KeyAction {
-        visible: root.dependenciesReady && !root.settingsOpen && !root.showCandidates
+        visible: root.dependenciesReady && root.inventoryReady && root.globalRulesReady && !root.needsInitialScan && !root.settingsOpen && !root.showCandidates
         text: root.t("Общий срок · ") + root.durationLabel(root.globalRules.lifetime_seconds)
         iconText: "\uf017"
         fontSize: Style.font.bodySmall
@@ -885,7 +867,8 @@ Panel {
         bordered: false
         foreground: Util.alpha(Color.popups.text, 0.65)
         tooltipText: root.t("Настроить общий срок доступа")
-        onClicked: root.settingsFor(null)
+        enabled: root.globalRulesReady && !root.activeRequest && !root.actionBusy
+        onClicked: root.editRules(null)
       }
     }
   }

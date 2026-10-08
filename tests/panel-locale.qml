@@ -49,13 +49,12 @@ ShellRoot {
   Plugin.Panel {
     id: panel
     manageIpc: false
-    firstScanRequested: true
     function refresh() {}
     function startCall(action, key, value, request) {
       test.check(action === "panel.list", "language changed access or settings")
       test.calls++
       var reply = {api_version:1, state:"ready", error_code:null, request_id:null, ui_language:test.metadataLanguage,
-        keys:test.fixture, global_rules:{lifetime_seconds:7200, revoke_on_sleep:true}, scanned:true, active_request:null}
+        keys:test.fixture, global_rules:{lifetime_seconds:7200, revoke_on_sleep:true}, scanned:true, scan_root:"/test/.ssh", scan_requires_consent:false, active_request:null}
       test.rpc.command = ["/usr/bin/python3", Quickshell.env("SSH_KEYS_TEST_REPLY"), JSON.stringify(reply)]
       test.rpc.running = true
       return true
@@ -89,25 +88,17 @@ ShellRoot {
       var counts = [1, 2, 5, 11, 21, 22, 25, 101, 111]
       var russian = ["1 ключ", "2 ключа", "5 ключей", "11 ключей", "21 ключ", "22 ключа", "25 ключей", "101 ключ", "111 ключей"]
       for (var i = 0; i < counts.length; ++i) test.check(panel.keyCountText(counts[i]) === russian[i], "Russian pluralization differs")
-      panel.settingsFor(null)
-      var lifetime = test.find(panel, "ssh-key-lifetime")
-      var amount = test.find(panel, "ssh-key-duration-amount")
-      var units = test.find(panel, "ssh-key-duration-unit")
-      var sleep = test.find(panel, "ssh-keys-revoke-on-sleep")
-      var save = test.find(panel, "ssh-key-save-rules")
-      lifetime.value = 90
-      lifetime.chooseUnit(3600)
-      sleep.checked = false
+      panel.settingsFor(test.fixture[0])
+      var edit = test.find(panel, "ssh-key-edit-rules")
+      var policy = test.find(panel, "ssh-key-policy-summary")
       var rows = JSON.stringify(panel.rows)
       panel.message = panel.responseDescription({operation:"unlock", state:"cancelled"})
       test.metadata("en")
-      test.check(panel.uiLanguage === "en" && lifetime.uiLanguage === "en", "system language did not reach duration editor")
+      test.check(panel.uiLanguage === "en", "system language not applied")
       test.check(repeater.itemAt(0) === first && JSON.stringify(panel.rows) === rows, "language refresh recreated rows or changed access")
-      test.check(panel.settingsOpen && lifetime.value === 90 && lifetime._unitSeconds === 3600 && amount.text === "" && !sleep.checked, "language refresh changed an unsaved settings draft")
+      test.check(panel.settingsOpen && policy.text === "2 h · Default duration", "effective policy not translated")
       test.check(access.text === "Lock" && access.tooltipText === "Revoke key" && method.text === "Fingerprint ⇅" && lockedAccess.text === "Unlock", "English actions or tooltips not refreshed")
-      test.check(save.text === "Save" && sleep.label === "Revoke before sleep" && amount.placeholderText === "Integer" && units.label === "Time unit", "English settings labels not refreshed")
-      test.check(units.options[0].label === "sec" && units.options[1].label === "min" && units.options[2].label === "h", "time-unit options not translated")
-      test.check(test.find(panel, "ssh-key-duration-preset-900").text === "15 min", "preset not translated")
+      test.check(edit.text === "Edit access rules", "editor launcher not translated")
       test.check(panel.message === "Operation cancelled · wait 30 s", "visible notice/cooldown was not translated")
       test.check(panel.keyCountText(0) === "0 keys" && panel.keyCountText(1) === "1 key" && panel.keyCountText(21) === "21 keys", "English pluralization differs")
       test.check(panel.durationLabel(0) === "unlimited" && panel.durationLabel(3600) === "1 h" && panel.durationLabel(120) === "2 min" && panel.durationLabel(45) === "45 s", "English duration labels differ")
@@ -123,8 +114,8 @@ ShellRoot {
       panel.settingsOpen = true
       panel.message = panel.describe("future_code")
       test.metadata("ru")
-      test.check(panel.message === "Ошибка KeyController: future_code" && save.text === "Сохранить" && amount.placeholderText === "Целое", "reverse metadata refresh not translated")
-      test.check(panel.settingsOpen && lifetime.value === 90 && lifetime._unitSeconds === 3600 && !sleep.checked, "reverse refresh changed draft")
+      test.check(panel.message === "Ошибка KeyController: future_code" && edit.text === "Изменить правила доступа", "reverse metadata refresh not translated")
+      test.check(panel.settingsOpen && policy.text === "2 ч · Общий срок", "reverse refresh changed policy")
       test.metadata("fr")
       test.check(panel.uiLanguage === "ru" && panel.message === "Не удалось связаться с помощником KeyController", "invalid normalized backend language was trusted")
       test.check(test.calls === 4 && panel.rows[0].expires_at === test.expiry && !panel.activeRequest, "locale testing caused an operation or extended lifetime")

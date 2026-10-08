@@ -22,10 +22,14 @@ pub struct KeySettings {
     pub fingerprint_mode: bool,
     pub rules: Option<Rules>,
 }
-#[derive(Clone, Debug, Default, Deserialize, Serialize)]
+#[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct Settings {
     pub scanned: bool,
+    // Unlike inventory validity, first discovery completion is never reset
+    // by later encryption/write failures.
+    #[serde(default)]
+    pub discovery_approved: bool,
     pub global: Rules,
     // Existing installations retain timer-only behavior until explicitly
     // enabling system-sleep revocation. Per-key rules stay lifetime-only.
@@ -33,10 +37,42 @@ pub struct Settings {
     pub revoke_on_sleep: bool,
     pub keys: BTreeMap<String, KeySettings>,
 }
-#[derive(Clone, Debug, Serialize, PartialEq, Eq)]
+// Defaults apply only when there is no persisted settings file. Serde keeps
+// old installations' explicit unlimited access and absent sleep opt-in intact.
+impl Default for Settings {
+    fn default() -> Self {
+        Self {
+            scanned: false,
+            discovery_approved: false,
+            global: Rules {
+                lifetime_seconds: 60,
+            },
+            revoke_on_sleep: true,
+            keys: BTreeMap::new(),
+        }
+    }
+}
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
 pub struct GlobalRules {
     pub lifetime_seconds: u32,
     pub revoke_on_sleep: bool,
+}
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct KeyPolicyEdit {
+    pub inherits: bool,
+    pub lifetime_seconds: u32,
+}
+// Validate the private native editor response in both the worker and service.
+// These types are deliberately not accepted by the public control socket.
+pub fn validate_policy_edit(operation: &str, value: &serde_json::Value) -> Result<()> {
+    let lifetime_seconds = match operation {
+        "settings.global" => serde_json::from_value::<GlobalRules>(value.clone())?.lifetime_seconds,
+        "settings.key" => serde_json::from_value::<KeyPolicyEdit>(value.clone())?.lifetime_seconds,
+        _ => return Err(Error("invalid_operation")),
+    };
+    Rules { lifetime_seconds }.validate()
 }
 impl Settings {
     pub fn global_rules(&self) -> GlobalRules {
@@ -48,6 +84,15 @@ impl Settings {
     // Only persisted settings may contain the obsolete boolean. Keep the API
     // strict, and never turn malformed or unknown stored values into defaults.
     pub fn from_persisted(mut value: serde_json::Value) -> Result<(Self, bool)> {
+        if let Some(object) = value.as_object_mut()
+            && !object.contains_key("discovery_approved")
+        {
+            let approved = object.get("scanned") == Some(&serde_json::Value::Bool(true));
+            object.insert(
+                "discovery_approved".into(),
+                serde_json::Value::Bool(approved),
+            );
+        }
         fn migrate(rules: &mut serde_json::Value) -> Result<bool> {
             let Some(object) = rules.as_object_mut() else {
                 return Ok(false);
@@ -169,6 +214,7 @@ mod tests {
         let (settings, migrated) = Settings::from_persisted(value).unwrap();
         assert!(migrated);
         assert!(settings.scanned);
+        assert!(settings.discovery_approved);
         assert_eq!(settings.effective("a").lifetime_seconds, 900);
         assert_eq!(settings.effective("b").lifetime_seconds, 45);
         assert!(settings.keys["a"].fingerprint_mode);
@@ -274,13 +320,12 @@ mod tests {
         assert_eq!(g.check("a", 4).unwrap_err().0, "cooldown");
     }
     #[test]
-    fn sleep_policy_defaults_off_and_never_enters_individual_rules() {
+    fn stored_sleep_policy_is_preserved_and_never_enters_individual_rules() {
         let legacy = json!({"scanned":true,"global":{"lifetime_seconds":900},"keys":{
             "a":{"fingerprint_mode":true,"rules":{"lifetime_seconds":45}}
         }});
         let (settings, migrated) = Settings::from_persisted(legacy.clone()).unwrap();
         assert!(!migrated && !settings.revoke_on_sleep);
-        assert!(!Settings::default().revoke_on_sleep);
         for enabled in [true, false] {
             let mut saved = legacy.clone();
             saved["revoke_on_sleep"] = json!(enabled);
@@ -310,6 +355,102 @@ mod tests {
             serde_json::from_value::<Rules>(json!({"lifetime_seconds":900,"revoke_on_sleep":true}))
                 .is_err()
         );
+    }
+
+    #[test]
+    fn fresh_defaults_do_not_rewrite_persisted_unlimited_or_sleep_opt_out() {
+        let fresh = Settings::default();
+        assert!(!fresh.scanned && fresh.keys.is_empty());
+        assert!(!fresh.discovery_approved);
+        assert_eq!(fresh.global.lifetime_seconds, 60);
+        assert!(fresh.revoke_on_sleep);
+        for sleep in [None, Some(false), Some(true)] {
+            let mut value = json!({"scanned":true,"global":{"lifetime_seconds":0},"keys":{}});
+            if let Some(enabled) = sleep {
+                value["revoke_on_sleep"] = json!(enabled);
+            }
+            let (saved, migrated) = Settings::from_persisted(value).unwrap();
+            assert!(!migrated && saved.scanned);
+            assert_eq!(saved.global.lifetime_seconds, 0);
+            assert_eq!(saved.revoke_on_sleep, sleep.unwrap_or(false));
+        }
+    }
+
+    #[test]
+    fn discovery_consent_migration_survives_inventory_invalidation() {
+        let legacy = json!({"scanned":true,"global":{"lifetime_seconds":0},"keys":{}});
+        let (mut settings, _) = Settings::from_persisted(legacy.clone()).unwrap();
+        assert!(settings.discovery_approved);
+        settings.scanned = false;
+        let (settings, _) =
+            Settings::from_persisted(serde_json::to_value(settings).unwrap()).unwrap();
+        assert!(!settings.scanned && settings.discovery_approved);
+        let mut undiscovered = legacy;
+        undiscovered["scanned"] = json!(false);
+        assert!(
+            !Settings::from_persisted(undiscovered)
+                .unwrap()
+                .0
+                .discovery_approved
+        );
+    }
+
+    #[test]
+    fn private_editor_values_require_exact_valid_shapes() {
+        for lifetime in [0, 60, 31_536_000] {
+            for enabled in [false, true] {
+                assert!(
+                    validate_policy_edit(
+                        "settings.global",
+                        &json!({
+                            "lifetime_seconds":lifetime,"revoke_on_sleep":enabled
+                        })
+                    )
+                    .is_ok()
+                );
+                assert!(
+                    validate_policy_edit(
+                        "settings.key",
+                        &json!({
+                            "lifetime_seconds":lifetime,"inherits":enabled
+                        })
+                    )
+                    .is_ok()
+                );
+            }
+        }
+        for operation in ["settings.global", "settings.key"] {
+            let flag = if operation == "settings.global" {
+                "revoke_on_sleep"
+            } else {
+                "inherits"
+            };
+            for invalid in [
+                json!(null),
+                json!({}),
+                json!([]),
+                json!(true),
+                json!({"lifetime_seconds":60}),
+                json!({flag:true}),
+            ] {
+                assert!(validate_policy_edit(operation, &invalid).is_err());
+            }
+            for invalid in [
+                json!(-1),
+                json!(31_536_001),
+                json!(1.5),
+                json!("60"),
+                json!(null),
+            ] {
+                let mut value = json!({"lifetime_seconds":invalid});
+                value[flag] = json!(true);
+                assert!(validate_policy_edit(operation, &value).is_err());
+            }
+            let mut value = json!({"lifetime_seconds":60,"confirmed":true});
+            value[flag] = json!(true);
+            assert!(validate_policy_edit(operation, &value).is_err());
+        }
+        assert!(validate_policy_edit("rules.global", &json!({"lifetime_seconds":60})).is_err());
     }
 
     #[test]

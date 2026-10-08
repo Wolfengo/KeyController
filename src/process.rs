@@ -171,6 +171,16 @@ pub fn wait(mut child: std::process::Child, seconds: u64) -> Result<()> {
 pub fn protected_spawn(c: &mut Command, mapping: &[(RawFd, RawFd)]) -> Result<std::process::Child> {
     protected_spawn_as(c, mapping, None)
 }
+fn hardening_library() -> Result<&'static str> {
+    // A release executable never loads code from its original build tree.
+    // Unit tests and explicitly non-production debug builds retain their
+    // compile-time test library, without accepting an environment override.
+    #[cfg(any(test, debug_assertions))]
+    if std::env::current_exe()?.parent() != Some(std::path::Path::new("/usr/lib/ssh-keys")) {
+        return Ok(env!("SSH_KEYS_BUILD_HARDEN"));
+    }
+    Ok("/usr/lib/ssh-keys/harden.so")
+}
 pub fn protected_spawn_as(
     c: &mut Command,
     mapping: &[(RawFd, RawFd)],
@@ -180,12 +190,7 @@ pub fn protected_spawn_as(
     if mapping.is_empty() || mapping.len() > 8 {
         return Err(Error("fd_failed"));
     }
-    let library =
-        if std::env::current_exe()?.parent() == Some(std::path::Path::new("/usr/lib/ssh-keys")) {
-            "/usr/lib/ssh-keys/harden.so"
-        } else {
-            env!("SSH_KEYS_BUILD_HARDEN")
-        };
+    let library = hardening_library()?;
     let (mut parent, child_socket) = UnixStream::pair()?;
     parent.set_read_timeout(Some(Duration::from_secs(2)))?;
     parent.set_write_timeout(Some(Duration::from_secs(2)))?;
