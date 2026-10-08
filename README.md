@@ -107,7 +107,7 @@ Install the widget with Omarchy's plugin manager:
 omarchy plugin add https://github.com/Wolfengo/KeyController.git --enable
 ```
 
-Requires Omarchy with Quickshell, OpenSSH and the separate **KeyController system package**. The widget checks dependencies and guides setup. Until the helper is available in your signed package repositories, it needs a [separate package installation](docs/setup.md#installation). Fingerprint use additionally requires TPM2, fprintd and an enrolled fingerprint; passphrase mode works without biometric hardware. [Full requirements and setup](docs/setup.md#installation)
+Requires Omarchy with Quickshell, OpenSSH and the separate **KeyController system package**. Choose **Install and set up** in the widget to install missing packages and connect the agent through one guided flow. The wizard uses signed system repositories; while the helper awaits [repository inclusion](https://github.com/omacom/omarchy-pkgs/pull/857), it shows package availability and a status link. Fingerprint use additionally requires TPM2, fprintd and an enrolled fingerprint; passphrase mode works without biometric hardware. [Full requirements and setup](docs/setup.md#installation)
 
 To remove the widget:
 

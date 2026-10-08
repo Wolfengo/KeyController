@@ -2,7 +2,7 @@
   "schemaVersion": 1,
   "id": "org.omarchy.keycontroller",
   "name": "KeyController",
-  "version": "0.2.1",
+  "version": "0.2.2",
   "author": "KeyController contributors",
   "license": "MIT AND Apache-2.0",
   "description": "OpenSSH keys with per-key passphrase and fingerprint unlock",

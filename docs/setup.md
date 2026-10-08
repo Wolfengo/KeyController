@@ -12,7 +12,17 @@ Install the widget through Omarchy:
 omarchy plugin add https://github.com/Wolfengo/KeyController.git --enable
 ```
 
-The widget requires the separate `keycontroller` system package. Catalogue listing does not add that package to Pacman repositories. Until a signed repository provides it, build the reviewed source below or install a release package for your architecture from [GitHub Releases](https://github.com/Wolfengo/KeyController/releases). The dependency button cannot install a package absent from the configured repositories.
+Open KeyController and choose **Install and set up**. One guided flow installs missing packages, connects the primary SSH agent and adds instructions for detected AI clients. Follow the visible Pacman and system authorization prompts; no commands need to be typed. The screen explains the configuration changes before you start. Existing host-specific agent exceptions are preserved and modified configuration has private backups.
+
+The wizard uses only your configured signed Omarchy/Arch package repositories. The separate `keycontroller` system package is still awaiting [repository inclusion](https://github.com/omacom/omarchy-pkgs/pull/857). Until it is available, the widget shows **Package not yet available**, the missing requirements and a link to the package status. It does not download a release package, add a repository or use an AUR helper. Once the package is published and your normal system update has refreshed the repository metadata, choose **Check again** and start the wizard.
+
+Automatic package installation supports the standard enabled repositories `core`, `extra`, `multilib` and `omarchy`. It stops if another repository is enabled, since Pacman could otherwise select transitive dependencies from that repository. Repository configuration is left unchanged. Desktop setup can still run when all required packages are already installed.
+
+The wizard automatically continues from package installation to desktop setup. If Python itself is missing, it installs Python first and continues in the same terminal. Pacman confirms each transaction, and desktop setup can request a separate system authorization. A failure stops the flow and leaves its result visible. Rerunning the wizard rechecks the current state and resumes only the missing steps; packages already installed are retained. Completion is shown only after configuration is verified. The final screen explains when existing applications need a new login to inherit the agent environment.
+
+## Manual package installation and development builds
+
+For testing before repository inclusion, a reviewed package can still be installed manually from [GitHub Releases](https://github.com/Wolfengo/KeyController/releases) or built from source. This is an optional developer path, not the widget's installation workflow.
 
 To build from source, use a separate working checkout outside the live plugin directory. This keeps generated build files out of the plugin's watched tree:
 
@@ -36,9 +46,9 @@ Run setup as the desktop user in an unlocked local session. It connects the mana
 
 The public agent socket is `/run/ssh-keys/UID/agent.sock`, and the helper service is `ssh-keysd@UID.service`. These private identifiers are retained for installation compatibility. Setup preserves an existing KeyController checkout and its bar position. Update a Git-installed widget with `omarchy plugin update org.omarchy.keycontroller`; update the privileged helper separately through its package. If no widget exists, setup creates a link to `/usr/share/keycontroller/plugin`, which then receives widget updates through the package manager. Restart the shell with `omarchy restart shell` after QML updates, while the screen is unlocked.
 
-Widget version `0.2.1` and system package version `0.1.0-24` are maintained separately; API v1 is their compatibility boundary. Setup records completion only after all configuration steps and the Hyprland reload succeed. If setup was interrupted, use **Set up KeyController** again or rerun `keycontroller-setup --apply`; an enabled service alone does not count as completed setup.
+Widget version `0.2.2` and system package version `0.1.0-24` are maintained separately; API v1 is their compatibility boundary. Setup records completion only after all configuration steps and the Hyprland reload succeed. If setup was interrupted, use **Set up KeyController** again or rerun `keycontroller-setup --apply`; an enabled service alone does not count as completed setup.
 
-For Omarchy plugin distribution, the repository's root `manifest.json` points to `plugin/Panel.qml`. The source packaging script also produces a standalone widget archive under `dist/`. The widget checks runtime dependencies and shows **Install packages** with the missing requirements when needed. Installation uses Pacman and the system's configured signed repositories, including Omarchy where available; it does not add repositories, use AUR or download installer scripts. If a required package is unavailable in those repositories, install a reviewed release package first. A first installation then offers **Set up KeyController** before enabling key controls.
+For Omarchy plugin distribution, the repository's root `manifest.json` points to `plugin/Panel.qml`. The source packaging script also produces a standalone widget archive under `dist/`. The widget checks runtime dependencies and shows **Install and set up** with the missing requirements when needed. If packages are already present, **Set up KeyController** starts the same wizard at the configuration step. Key controls stay unavailable until setup has completed and the wizard has released its installation lock.
 
 Required runtime packages are `keycontroller>=0.1.0-24`, `openssh>=10.5p1`, `qt6-base`, `qt6-svg`, `qt6-wayland`, `layer-shell-qt>=6.6`, `systemd`, `pam`, `python` and `polkit`. Linux 6.5 or newer, an active local Hyprland/logind session and Yama `kernel.yama.ptrace_scope` of 1, 2 or 3 are required. Fingerprint use additionally requires `fprintd`, a system-enrolled fingerprint and TPM2. Passphrase unlocking remains available without biometric hardware.
 

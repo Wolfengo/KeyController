@@ -13,12 +13,16 @@ SUDO=/usr/bin/sudo
 TIMEOUT=/usr/bin/timeout
 FLOCK=/usr/bin/flock
 STAT=/usr/bin/stat
+ENV=/usr/bin/env
+VERCMP=/usr/bin/vercmp
+HELPER_REQUIREMENT='keycontroller>=0.1.0-24'
 
 case "$#:$1:${2-}" in
     1:--install:) mode=install ;;
     1:--setup:) mode=setup ;;
+    1:--wizard:) mode=wizard ;;
     1:--check:|2:--check:--json) mode=check ;;
-    *) echo 'Usage: dependencies --check --json | --install | --setup' >&2; exit 2 ;;
+    *) echo 'Usage: dependencies --check --json | --install | --setup | --wizard' >&2; exit 2 ;;
 esac
 
 if [ -x "$PYTHON" ]; then
@@ -35,6 +39,10 @@ lock=$runtime/keycontroller-dependencies.lock
 repository=
 reason=repository_unavailable
 available=false
+helper_missing=false
+helper_available=false
+helper_repository=
+helper_reason=
 installing=false
 error_code=python_required
 state=missing
@@ -46,15 +54,156 @@ valid_lock() {
 }
 emit() {
     if [ -n "$repository" ]; then repo_json="\"$repository\""; else repo_json=null; fi
-    # Before Python is available, only its bootstrap requirement is known.
-    # Locale and the complete list are evaluated by Python on the next check.
+    installable=$available
+    # Bootstrap can validate Python and the required helper. Python evaluates
+    # the remaining dependencies and system locale after this partial check.
     if [ "$state" = error ]; then missing='[]'; else
-        missing="[{\"name\":\"python\",\"requirement\":\"python\",\"repository\":$repo_json,\"available\":$available,\"reason\":$reason_json}]"
+        missing="[{\"name\":\"python\",\"requirement\":\"python\",\"repository\":$repo_json,\"available\":$available,\"reason\":$reason_json}"
+        if [ "$helper_missing" = true ]; then
+            if [ -n "$helper_repository" ]; then helper_repo_json="\"$helper_repository\""; else helper_repo_json=null; fi
+            if [ -n "$helper_reason" ]; then helper_reason_json="\"$helper_reason\""; else helper_reason_json=null; fi
+            missing="$missing,{\"name\":\"keycontroller\",\"requirement\":\"$HELPER_REQUIREMENT\",\"repository\":$helper_repo_json,\"available\":$helper_available,\"reason\":$helper_reason_json}"
+            [ "$helper_available" = true ] || installable=false
+        fi
+        missing="$missing]"
     fi
+    [ "$state" != error ] || installable=false
     printf '{"schema_version":1,"state":"%s","ui_language":"en","missing":%s,"optional":{},"complete":false,"setup_required":false,"migration_required":false,"installable":%s,"installing":%s,"error_code":"%s"}\n' \
-        "$state" "$missing" "$available" "$installing" "$error_code"
+        "$state" "$missing" "$installable" "$installing" "$error_code"
 }
 fail() { state=error; available=false; error_code=$1; }
+
+check_signatures() {
+    signatures=$(run "$PACMAN_CONF" SigLevel 2>/dev/null)
+    [ "$?" = 0 ] || fail repository_config_invalid
+    overrides=$(run "$PACMAN_CONF" --repo "$1" SigLevel 2>/dev/null)
+    [ "$?" = 0 ] || fail repository_config_invalid
+    required=false
+    trusted=false
+    for token in $signatures $overrides; do
+        case "$token" in
+            Required|PackageRequired) required=true ;;
+            Optional|Never|PackageOptional|PackageNever) required=false ;;
+            TrustedOnly|PackageTrustedOnly) trusted=true ;;
+            TrustAll|PackageTrustAll) trusted=false ;;
+            Database*) ;;
+            *) fail repository_config_invalid ;;
+        esac
+    done
+    if [ "$state" != error ] && [ "$required:$trusted" != true:true ]; then
+        fail repository_signatures_disabled
+    fi
+}
+
+resolve_package() {
+    package=$1
+    minimum=${2-}
+    repository=
+    reason=repository_unavailable
+    available=false
+    metadata=$(run "$PACMAN" -Si "$package" 2>/dev/null)
+    result=$?
+    if [ "$result" = 124 ]; then
+        fail package_check_timeout
+    elif [ "$result" != 0 ] && [ "$result" != 1 ]; then
+        fail package_manager_unavailable
+    elif [ "$result" = 0 ]; then
+        name=
+        version=
+        while IFS= read -r line; do
+            case "$line" in
+                Repository*:*|Name*:*|Version*:*)
+                    value=${line#*:}
+                    # Metadata names contain no whitespace. Split without
+                    # globbing (set -f) and reject multiple words.
+                    set -- $value
+                    if [ "$#" != 1 ]; then fail package_metadata_invalid; break; fi
+                    case "$line" in Repository*) repository=$1;; Name*) name=$1;; Version*) version=$1;; esac
+                    ;;
+                '') [ -n "$name" ] && break ;;
+            esac
+        done <<EOF
+$metadata
+EOF
+        case "$repository" in ''|[!A-Za-z0-9]*|*[!A-Za-z0-9_.+-]*) fail package_metadata_invalid ;; esac
+        [ "$name" = "$package" ] || fail package_metadata_invalid
+        case "$version" in ''|[!A-Za-z0-9]*|*[!A-Za-z0-9:+._~-]*) fail package_metadata_invalid ;; esac
+        repos=$(run "$PACMAN_CONF" --repo-list 2>/dev/null)
+        [ "$?" = 0 ] || fail repository_config_invalid
+        found=false
+        for candidate in $repos; do
+            case "$candidate" in
+                core|extra|multilib|omarchy) ;;
+                *) fail unsupported_repositories; break ;;
+            esac
+            [ "$candidate" = "$repository" ] && found=true
+        done
+        if [ "$state" != error ] && [ "$found" != true ]; then fail repository_config_invalid; fi
+        # The solver can use every enabled repo for transitive dependencies.
+        if [ "$state" != error ]; then
+            for candidate in $repos; do
+                check_signatures "$candidate"
+                [ "$state" != error ] || break
+            done
+        fi
+        if [ "$state" != error ]; then
+            available=true
+            reason=
+            if [ -n "$minimum" ]; then
+                comparison=$(run "$VERCMP" "$version" "$minimum" 2>/dev/null)
+                [ "$?" = 0 ] || fail package_metadata_invalid
+                case "$comparison" in
+                    -1) available=false; reason=repository_version_too_old ;;
+                    0|1) ;;
+                    *) fail package_metadata_invalid ;;
+                esac
+            fi
+        fi
+    fi
+}
+
+check_helper() {
+    helper_missing=false
+    helper_available=false
+    helper_repository=
+    helper_reason=
+    needs=$(run "$PACMAN" -T "$HELPER_REQUIREMENT" 2>/dev/null)
+    result=$?
+    if [ "$result" = 0 ] && [ -z "$needs" ]; then return; fi
+    if [ "$result" = 124 ]; then fail package_check_timeout; return; fi
+    if [ "$result" != 127 ] || [ "$needs" != "$HELPER_REQUIREMENT" ]; then fail package_check_failed; return; fi
+    helper_missing=true
+    python_repository=$repository
+    python_available=$available
+    python_reason=$reason
+    resolve_package keycontroller "${HELPER_REQUIREMENT#*>=}"
+    helper_repository=$repository
+    helper_available=$available
+    helper_reason=$reason
+    repository=$python_repository
+    available=$python_available
+    reason=$python_reason
+}
+
+wizard_preflight() {
+    # Recheck under the lock: unavailable helper must block even Python
+    # installation. Never fetch a release/AUR or add repositories.
+    check_helper
+    [ "$state" != error ] || finish_failure "$error_code"
+    if [ "$helper_missing" = true ] && [ "$helper_available" != true ]; then
+        finish_failure "$helper_reason"
+    fi
+    resolve_package python
+    [ "$state" != error ] || finish_failure "$error_code"
+    [ "$available" = true ] || finish_failure "$reason"
+}
+
+continue_wizard() {
+    # The next process opens its own lock. Close this flock lease before exec
+    # and pass the requested wizard mode explicitly.
+    exec 9<&-
+    exec "$PYTHON" -I "$(dirname -- "$0")/dependencies.py" --wizard
+}
 
 if [ "$uid" = 0 ]; then
     fail root_not_allowed
@@ -68,67 +217,10 @@ else
     elif [ "$result" != 127 ] || [ "$needs" != python ]; then
         fail package_check_failed
     else
-        metadata=$(run "$PACMAN" -Si python 2>/dev/null)
-        result=$?
-        if [ "$result" = 124 ]; then
-            fail package_check_timeout
-        elif [ "$result" != 0 ] && [ "$result" != 1 ]; then
-            fail package_manager_unavailable
-        elif [ "$result" = 0 ]; then
-            name=
-            while IFS= read -r line; do
-                case "$line" in
-                    Repository*:*|Name*:*)
-                        value=${line#*:}
-                        # Metadata names contain no whitespace. Split without
-                        # globbing (set -f) and reject multiple words.
-                        set -- $value
-                        if [ "$#" != 1 ]; then fail package_metadata_invalid; break; fi
-                        case "$line" in Repository*) repository=$1;; Name*) name=$1;; esac
-                        ;;
-                    '') [ -n "$name" ] && break ;;
-                esac
-            done <<EOF
-$metadata
-EOF
-            case "$repository" in ''|*[!A-Za-z0-9_.+-]*) fail package_metadata_invalid ;; esac
-            [ "$name" = python ] || fail package_metadata_invalid
-            repos=$(run "$PACMAN_CONF" --repo-list 2>/dev/null)
-            [ "$?" = 0 ] || fail repository_config_invalid
-            found=false
-            for candidate in $repos; do
-                [ "$candidate" = "$repository" ] && found=true
-            done
-            [ "$found" = true ] || fail repository_config_invalid
-            if [ "$state" != error ]; then
-                signatures=$(run "$PACMAN_CONF" SigLevel 2>/dev/null)
-                [ "$?" = 0 ] || fail repository_config_invalid
-                overrides=$(run "$PACMAN_CONF" --repo "$repository" SigLevel 2>/dev/null)
-                [ "$?" = 0 ] || fail repository_config_invalid
-                required=false
-                trusted=false
-                for token in $signatures $overrides; do
-                    case "$token" in
-                        Required|PackageRequired) required=true ;;
-                        Optional|Never|PackageOptional|PackageNever) required=false ;;
-                        TrustedOnly|PackageTrustedOnly) trusted=true ;;
-                        TrustAll|PackageTrustAll) trusted=false ;;
-                        Database*) ;;
-                        *) fail repository_config_invalid ;;
-                    esac
-                done
-                if [ "$state" != error ]; then
-                    if [ "$required:$trusted" = true:true ]; then
-                        available=true
-                        reason=
-                    else
-                        reason=repository_signatures_disabled
-                    fi
-                fi
-            fi
-        fi
+        resolve_package python
     fi
 fi
+if [ "$state" != error ] && [ "$mode" != install ]; then check_helper; fi
 if valid_lock && ! (exec 9<"$lock"; "$FLOCK" -n 9) 2>/dev/null; then installing=true; fi
 if [ -n "$reason" ]; then reason_json="\"$reason\""; else reason_json=null; fi
 if [ "$mode" = check ]; then
@@ -139,6 +231,16 @@ fi
 
 finish_failure() {
     printf 'KeyController: %s.\n' "$1" >&2
+    case "$1" in
+        repository_unavailable)
+            printf 'Required package is absent from configured repositories. Wait for publication; no other download source will be used.\n' >&2 ;;
+        repository_version_too_old)
+            printf 'Configured repositories have no suitable version. Update the system using its normal updater.\n' >&2 ;;
+        repository_signatures_disabled)
+            printf 'Every configured repository must require trusted package signatures.\n' >&2 ;;
+        unsupported_repositories)
+            printf 'Automatic installation supports only default Omarchy/Arch repositories: core, extra, multilib, omarchy. Repository configuration is not changed.\n' >&2 ;;
+    esac
     if [ -t 0 ] && [ -t 1 ]; then
         printf 'Press Enter to close this window… '
         IFS= read -r _ || :
@@ -159,12 +261,27 @@ exec 9<"$lock" || finish_failure install_lock_unavailable
 needs=$(run "$PACMAN" -T python 2>/dev/null)
 result=$?
 if [ "$result" = 0 ] && [ -x "$PYTHON" ]; then
+    if [ "$mode" = wizard ]; then continue_wizard; fi
     printf 'Python is available. Reopen KeyController to check the remaining packages.\n'
     exit 0
 fi
 [ "$result" = 127 ] && [ "$needs" = python ] || finish_failure package_check_failed
+if [ "$mode" = wizard ]; then
+    printf 'KeyController: install packages from configured repositories, then set up the primary SSH agent.\n'
+    printf 'Changed settings are backed up; explicit IdentityAgent exceptions are preserved; AI-agent instructions are linked.\n'
+    wizard_preflight
+fi
 printf 'KeyController: install python [%s].\n' "$repository"
 printf 'Only Python will be installed now. Pacman will show its dependencies and request confirmation.\n'
-"$SUDO" "$PACMAN" -S --needed -- "$repository/python" 9<&- || finish_failure package_install_failed
+interactive_term=dumb
+case "${TERM-}" in
+    ''|*[!A-Za-z0-9_.+-]*) ;;
+    *) [ "${#TERM}" -gt 64 ] || interactive_term=$TERM ;;
+esac
+# Preserve graphical-session variables for the unprivileged wizard handoff,
+# but keep them and user-selected config paths away from sudo/pacman.
+"$ENV" -i PATH=/usr/bin LANG=C LC_ALL=C TERM="$interactive_term" \
+    "$SUDO" "$PACMAN" -S --needed -- "$repository/python" 9<&- || finish_failure package_install_failed
 [ -x "$PYTHON" ] && run "$PACMAN" -T python >/dev/null 2>&1 || finish_failure dependencies_still_missing
+if [ "$mode" = wizard ]; then continue_wizard; fi
 printf 'Python installed. Reopen KeyController to review the complete package list.\n'

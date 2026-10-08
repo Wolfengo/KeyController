@@ -36,6 +36,7 @@ QUERY_TIMEOUT = 8
 QUERY_ENV = {"PATH": "/usr/bin", "LANG": "C", "LC_ALL": "C"}
 SAFE_NAME = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.+-]*\Z")
 SAFE_VERSION = re.compile(r"[A-Za-z0-9][A-Za-z0-9:+._~\-]*\Z")
+OFFICIAL_REPOSITORIES = frozenset(("core", "extra", "multilib", "omarchy"))
 
 
 class DependencyError(Exception):
@@ -165,6 +166,12 @@ def configured_repositories():
     if (result.returncode or len(repositories) != len(set(repositories))
             or any(not SAFE_NAME.fullmatch(repo) for repo in repositories)):
         raise DependencyError("repository_config_invalid")
+    # Pacman also resolves transitive dependencies from enabled repositories.
+    # Restrict the complete configuration, not only our explicit targets.
+    if any(repo not in OFFICIAL_REPOSITORIES for repo in repositories):
+        raise DependencyError("unsupported_repositories")
+    if any(not signatures_required(repo) for repo in repositories):
+        raise DependencyError("repository_signatures_disabled")
     return repositories
 
 
@@ -322,7 +329,7 @@ def installation_targets(status):
     for item in status["missing"]:
         if (item["requirement"] not in REQUIREMENTS
                 or item["name"] != item["requirement"].partition(">=")[0]
-                or not item["available"] or not SAFE_NAME.fullmatch(item["repository"] or "")):
+                or not item["available"] or item["repository"] not in OFFICIAL_REPOSITORIES):
             raise DependencyError("package_metadata_invalid")
         target = item["repository"] + "/" + item["name"]
         if target in targets:
@@ -334,6 +341,23 @@ def installation_targets(status):
 
 
 MESSAGES = {
+    "wizard_intro": ("KeyController: установка и настройка", "KeyController: install and set up"),
+    "wizard_scope": (
+        "Будут установлены недостающие пакеты из подключённых репозиториев и настроен основной SSH-агент. Изменяемые настройки сохраняются в резервной копии; явные исключения IdentityAgent сохраняются. Инструкции для установленных ИИ-агентов будут подключены.",
+        "Missing packages will be installed from configured repositories and the primary SSH agent will be configured. Changed settings are backed up; explicit IdentityAgent exceptions are preserved. Instructions for installed AI agents will be linked."),
+    "wizard_packages": ("1/3 — Проверка и установка пакетов", "1/3 — Check and install packages"),
+    "wizard_setup": ("2/3 — Настройка интеграции", "2/3 — Set up desktop integration"),
+    "wizard_verify": ("3/3 — Проверка результата", "3/3 — Verify the result"),
+    "wizard_complete": ("KeyController готов к работе.", "KeyController is ready."),
+    "relogin": (
+        "Выйдите из сеанса и войдите снова, чтобы все приложения использовали настроенный SSH-агент. Выход не выполняется автоматически.",
+        "Log out and log back in so all applications use the configured SSH agent. You will not be logged out automatically."),
+    "dependencies_not_installable": (
+        "Нужные пакеты пока недоступны в подключённых репозиториях с доверенными подписями. Дождитесь их публикации или обновите систему штатным способом.",
+        "Required packages are not yet available from configured repositories with trusted signatures. Wait for publication or update the system using its normal updater."),
+    "unsupported_repositories": (
+        "Автоматическая установка поддерживает только стандартные репозитории Omarchy/Arch: core, extra, multilib, omarchy. Настройки репозиториев не изменяются.",
+        "Automatic installation supports only the default Omarchy/Arch repositories: core, extra, multilib, omarchy. Repository configuration is not changed."),
     "intro": ("KeyController: установка недостающих пакетов", "KeyController: install missing packages"),
     "confirmation": (
         "Pacman покажет полный список, включая зависимости, и запросит подтверждение. Обновление всей системы не запускается.",
@@ -350,7 +374,9 @@ MESSAGES = {
     "hold": ("Нажмите Enter, чтобы закрыть окно…", "Press Enter to close this window…"),
     "repository_unavailable": ("пакет отсутствует в подключённых репозиториях", "package is absent from configured repositories"),
     "repository_version_too_old": ("в индексе репозитория нет нужной версии; обновите систему штатным способом", "repository index has no suitable version; update the system using its normal updater"),
-    "repository_signatures_disabled": ("репозиторий не требует доверенную подпись пакета", "repository does not require trusted package signatures"),
+    "repository_signatures_disabled": (
+        "Все подключённые репозитории должны требовать доверенные подписи пакетов.",
+        "Every configured repository must require trusted package signatures."),
 }
 
 
@@ -396,7 +422,86 @@ def link_agent_skills(language):
     print(message("skills", language))
 
 
-def install_dependencies():
+def checked_dependencies():
+    status = check_dependencies(include_installing=False)
+    if status["state"] == "error":
+        raise DependencyError(status["error_code"])
+    return status
+
+
+def install_packages(status, language):
+    """Called only while the caller owns installation_lock()."""
+    if status["state"] == "missing":
+        for item in status["missing"]:
+            source = item["repository"] or "—"
+            print("  " + item["requirement"] + " [" + source + "]")
+            if item["reason"]:
+                print("    " + message(item["reason"], language))
+        # Validate the complete transaction before any package or setup effect.
+        targets = installation_targets(status)
+        print(message("confirmation", language), flush=True)
+        try:
+            result = subprocess.run([SUDO, PACMAN, "-S", "--needed", "--", *targets],
+                                    env=interactive_env(), close_fds=True, check=False)
+        except OSError:
+            raise DependencyError("package_install_failed") from None
+        if result.returncode:
+            raise DependencyError("package_install_failed")
+        status = checked_dependencies()
+        if status["state"] != "ready":
+            raise DependencyError("dependencies_still_missing")
+    print(message("ready", language))
+    return status
+
+
+def run_user_setup(action, language):
+    label = "migration_intro" if action == "--migrate-brand" else "setup_intro"
+    print(message(label, language), flush=True)
+    try:
+        result = subprocess.run([SETUP, action], env=user_setup_env(include_session=True),
+                                close_fds=True, check=False)
+    except OSError:
+        raise DependencyError("setup_failed") from None
+    if result.returncode:
+        raise DependencyError("setup_failed")
+    return checked_dependencies()
+
+
+def configure_user(status, language, finish_migration=False):
+    """Use only the installed per-user setup program, never sudo plugin code."""
+    if status["state"] != "ready":
+        raise DependencyError("dependencies_still_missing")
+    changed = bool(status["setup_required"] or status["migration_required"])
+    if changed:
+        if status["migration_required"]:
+            status = run_user_setup("--migrate-brand", language)
+            if finish_migration and status["state"] == "ready" and not status["migration_required"]:
+                # Older integration can predate the completion receipt. Finish
+                # explicitly requested initial setup after safe brand migration.
+                if status["setup_required"]:
+                    if legacy_widget_state() != "absent":
+                        raise DependencyError("legacy_widget_conflict")
+                    status = run_user_setup("--apply", language)
+        else:
+            # Existing legacy directories/custom links need human review.
+            if legacy_widget_state() != "absent":
+                raise DependencyError("legacy_widget_conflict")
+            status = run_user_setup("--apply", language)
+        if (status["state"] != "ready" or status["setup_required"]
+                or status["migration_required"]):
+            raise DependencyError("setup_incomplete")
+    return changed
+
+
+def hold_terminal(language):
+    if sys.stdin.isatty() and sys.stdout.isatty():
+        try:
+            input(message("hold", language))
+        except (EOFError, KeyboardInterrupt):
+            pass
+
+
+def interactive_operation(operation, hold_success=False):
     language = system_language()
     try:
         if os.geteuid() == 0:
@@ -404,91 +509,58 @@ def install_dependencies():
         if not sys.stdin.isatty() or not sys.stdout.isatty():
             raise DependencyError("interactive_terminal_required")
         with installation_lock():
-            status = check_dependencies(include_installing=False)
-            if status["state"] == "error":
-                raise DependencyError(status["error_code"])
-            print(message("intro", language))
-            if status["state"] == "missing":
-                for item in status["missing"]:
-                    source = item["repository"] or "—"
-                    print("  " + item["requirement"] + " [" + source + "]")
-                    if item["reason"]:
-                        print("    " + message(item["reason"], language))
-                targets = installation_targets(status)
-                print(message("confirmation", language), flush=True)
-                try:
-                    result = subprocess.run([SUDO, PACMAN, "-S", "--needed", "--", *targets],
-                                            env=interactive_env(), close_fds=True, check=False)
-                except OSError:
-                    raise DependencyError("package_install_failed") from None
-                if result.returncode:
-                    raise DependencyError("package_install_failed")
-                verified = check_dependencies(include_installing=False)
-                if verified["state"] != "ready":
-                    raise DependencyError("dependencies_still_missing")
-            print(message("ready", language))
-            link_agent_skills(language)
-            print(message("setup", language))
+            operation(checked_dependencies(), language)
+        if hold_success:
+            hold_terminal(language)
         return 0
     except (DependencyError, KeyboardInterrupt) as error:
         code = error.code if isinstance(error, DependencyError) else "installation_cancelled"
         print(message("failure", language) + " (" + code + ").", file=sys.stderr)
-        if sys.stdin.isatty() and sys.stdout.isatty():
-            try:
-                input(message("hold", language))
-            except (EOFError, KeyboardInterrupt):
-                pass
+        if code in MESSAGES:
+            print(message(code, language), file=sys.stderr)
+        hold_terminal(language)
         return 1
+
+
+def install_dependencies():
+    """Compatibility action: install packages and agent instructions only."""
+    def install(status, language):
+        print(message("intro", language))
+        install_packages(status, language)
+        link_agent_skills(language)
+        print(message("setup", language))
+    return interactive_operation(install)
 
 
 def configure_integration():
-    """Explicit visible user action, separate from installing package files."""
-    language = system_language()
-    try:
-        if os.geteuid() == 0:
-            raise DependencyError("root_not_allowed")
-        if not sys.stdin.isatty() or not sys.stdout.isatty():
-            raise DependencyError("interactive_terminal_required")
-        with installation_lock():
-            status = check_dependencies(include_installing=False)
-            if status["state"] == "error":
-                raise DependencyError(status["error_code"])
-            if status["state"] != "ready":
-                raise DependencyError("dependencies_still_missing")
-            if not status["setup_required"]:
-                print(message("configured", language))
-                return 0
-            if status["migration_required"]:
-                action, label = "--migrate-brand", "migration_intro"
-            else:
-                # Existing legacy directories/custom links need human review.
-                # Never treat them as an initial installation to overwrite.
-                if legacy_widget_state() != "absent":
-                    raise DependencyError("legacy_widget_conflict")
-                action, label = "--apply", "setup_intro"
-            print(message(label, language), flush=True)
-            try:
-                result = subprocess.run([SETUP, action], env=user_setup_env(include_session=True),
-                                        close_fds=True, check=False)
-            except OSError:
-                raise DependencyError("setup_failed") from None
-            if result.returncode:
-                raise DependencyError("setup_failed")
-            verified = check_dependencies(include_installing=False)
-            if (verified["state"] != "ready" or verified["setup_required"]
-                    or verified["migration_required"]):
-                raise DependencyError("setup_incomplete")
-            print(message("configured", language))
-        return 0
-    except (DependencyError, KeyboardInterrupt) as error:
-        code = error.code if isinstance(error, DependencyError) else "installation_cancelled"
-        print(message("failure", language) + " (" + code + ").", file=sys.stderr)
-        if sys.stdin.isatty() and sys.stdout.isatty():
-            try:
-                input(message("hold", language))
-            except (EOFError, KeyboardInterrupt):
-                pass
-        return 1
+    """Compatibility action: explicit setup without installing packages."""
+    def configure(status, language):
+        configure_user(status, language)
+        print(message("configured", language))
+    return interactive_operation(configure)
+
+
+def setup_wizard():
+    """The combined visible UI action explicitly authorizes per-user setup."""
+    def wizard(status, language):
+        print(message("wizard_intro", language))
+        print(message("wizard_scope", language), flush=True)
+        print(message("wizard_packages", language), flush=True)
+        status = install_packages(status, language)
+        print(message("wizard_setup", language), flush=True)
+        configure_user(status, language, finish_migration=True)
+        # Also verify instructions after --apply: older packaged setup versions
+        # report skill conflicts without failing their desktop setup action.
+        # This is idempotent and retains user-owned conflicting instructions.
+        link_agent_skills(language)
+        print(message("wizard_verify", language), flush=True)
+        verified = checked_dependencies()
+        if (verified["state"] != "ready" or verified["setup_required"]
+                or verified["migration_required"]):
+            raise DependencyError("setup_incomplete")
+        print(message("wizard_complete", language))
+        print(message("relogin", language), flush=True)
+    return interactive_operation(wizard, hold_success=True)
 
 
 def main(argv=None):
@@ -497,11 +569,14 @@ def main(argv=None):
     mode.add_argument("--check", action="store_true")
     mode.add_argument("--install", action="store_true")
     mode.add_argument("--setup", action="store_true")
+    mode.add_argument("--wizard", action="store_true")
     parser.add_argument("--json", action="store_true")
     args = parser.parse_args(argv)
-    if args.install or args.setup:
+    if args.install or args.setup or args.wizard:
         if args.json:
-            parser.error("--install and --setup require a visible terminal, not --json")
+            parser.error("--install, --setup and --wizard require a visible terminal, not --json")
+        if args.wizard:
+            return setup_wizard()
         return configure_integration() if args.setup else install_dependencies()
     status = check_dependencies()
     print(json.dumps(status, ensure_ascii=False))

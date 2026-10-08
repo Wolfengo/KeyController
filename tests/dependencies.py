@@ -6,6 +6,7 @@ import json
 import os
 from pathlib import Path
 import pty
+import re
 import subprocess
 import sys
 import tempfile
@@ -132,13 +133,38 @@ class DependencyTests(unittest.TestCase):
                 database.signatures["extra"] = policy
                 status = self.check(database)
                 self.assertFalse(status["installable"])
-                self.assertEqual(status["missing"][0]["reason"], "repository_signatures_disabled")
+                self.assertEqual(status["state"], "error")
+                self.assertEqual(status["error_code"], "repository_signatures_disabled")
 
     def test_unsigned_global_policy_can_be_tightened_by_repository(self):
         database = PackageDatabase(["qt6-svg"], {"qt6-svg": ("extra", "6.11.2-1")})
         database.signatures[None] = "PackageOptional PackageTrustedOnly DatabaseOptional"
-        database.signatures["extra"] = "PackageRequired"
+        for repo in database.repositories:
+            database.signatures[repo] = "PackageRequired"
         self.assertTrue(self.check(database)["installable"])
+
+    def test_signed_third_party_repo_blocks_installation_and_transitive_resolution(self):
+        database = PackageDatabase(["qt6-svg"], {"qt6-svg": ("extra", "6.11.2-1")})
+        database.repositories.append("custom-signed")
+        status = self.check(database)
+        self.assertEqual(status["state"], "error")
+        self.assertEqual(status["error_code"], "unsupported_repositories")
+        self.assertFalse(status["installable"])
+
+    def test_unsigned_other_official_repo_blocks_transitive_resolution(self):
+        database = PackageDatabase(["qt6-svg"], {"qt6-svg": ("extra", "6.11.2-1")})
+        database.signatures["omarchy"] = "PackageOptional"
+        status = self.check(database)
+        self.assertEqual(status["error_code"], "repository_signatures_disabled")
+        self.assertFalse(status["installable"])
+
+    def test_installed_dependencies_allow_setup_without_repository_policy(self):
+        database = PackageDatabase()
+        database.repositories.append("custom-signed")
+        database.signatures["omarchy"] = "PackageNever"
+        status = self.check(database)
+        self.assertEqual(status["state"], "ready")
+        self.assertFalse(any(call[0] == dependencies.PACMAN_CONF for call in database.calls))
 
     def test_repository_metadata_cannot_inject_targets_or_terminal_escapes(self):
         for repository, version in [("extra;evil", "1"), ("foreign", "1"),
@@ -182,7 +208,7 @@ class DependencyTests(unittest.TestCase):
     def test_install_targets_reject_forged_requirements_and_repository_operands(self):
         base = {"name": "qt6-svg", "requirement": "qt6-svg", "available": True, "repository": "extra"}
         for updates in [{"name": "-y"}, {"requirement": "evil"}, {"repository": "-y"},
-                        {"repository": "extra;evil"}, {"available": False}]:
+                        {"repository": "extra;evil"}, {"repository": "custom-signed"}, {"available": False}]:
             with self.subTest(updates=updates):
                 item = dict(base, **updates)
                 with self.assertRaises(dependencies.DependencyError):
@@ -191,7 +217,9 @@ class DependencyTests(unittest.TestCase):
     def test_cli_rejects_package_operands_json_install_and_unknown_modes(self):
         for arguments in [["--install", "evil"], ["--install", "--json"],
                           ["--check", "--install"], ["--check", "--repo", "evil"],
-                          ["--setup", "evil"], ["--setup", "--install"], ["--setup", "--json"]]:
+                          ["--setup", "evil"], ["--setup", "--install"], ["--setup", "--json"],
+                          ["--wizard", "evil"], ["--wizard", "--json"], ["--wizard", "--install"],
+                          ["--wizard", "--setup"]]:
             with self.subTest(arguments=arguments), contextlib.redirect_stderr(io.StringIO()):
                 with self.assertRaises(SystemExit):
                     dependencies.main(arguments)
@@ -486,11 +514,220 @@ class InstallationTests(unittest.TestCase):
         self.assertIn("setup_incomplete", self.terminal.getvalue())
 
 
+class WizardTests(unittest.TestCase):
+    setUp = InstallationTests.setUp
+
+    def test_one_lock_covers_packages_verification_setup_and_final_verification(self):
+        events = []
+        locked = False
+        @contextlib.contextmanager
+        def lock():
+            nonlocal locked
+            self.assertFalse(locked)
+            locked = True
+            events.append("lock")
+            yield
+            events.append("release")
+            locked = False
+        statuses = iter([self.missing, dict(self.ready, setup_required=True), self.ready, self.ready])
+        def check(**kwargs):
+            self.assertTrue(locked)
+            self.assertEqual(kwargs, {"include_installing": False})
+            events.append("check")
+            return next(statuses)
+        def run(command, **kwargs):
+            self.assertTrue(locked)
+            self.assertTrue(kwargs["close_fds"])
+            self.assertNotIn("shell", kwargs)
+            events.append("install" if command[0] == dependencies.SUDO else
+                          "skills" if command[1] == "--install-agent-skills" else "setup")
+            return result()
+        with patch.object(dependencies, "installation_lock", side_effect=lock), \
+                patch.object(dependencies, "check_dependencies", side_effect=check), \
+                patch.object(dependencies, "legacy_widget_state", return_value="absent"), \
+                patch.object(dependencies.subprocess, "run", side_effect=run) as calls:
+            self.assertEqual(dependencies.setup_wizard(), 0)
+        self.assertEqual(events, ["lock", "check", "install", "check", "setup", "check", "skills", "check", "release"])
+        self.assertEqual([call.args[0] for call in calls.call_args_list], [
+            [dependencies.SUDO, dependencies.PACMAN, "-S", "--needed", "--", "extra/qt6-svg"],
+            [dependencies.SETUP, "--apply"], [dependencies.SETUP, "--install-agent-skills"]])
+        output = self.terminal.getvalue()
+        self.assertLess(output.index("primary SSH agent"), output.index("1/3"))
+        self.assertLess(output.index("1/3"), output.index("2/3"))
+        self.assertLess(output.index("2/3"), output.index("3/3"))
+        self.assertIn("Log out and log back in", output)
+        self.assertIn("Press Enter", output)
+
+    def test_cli_dispatches_only_literal_wizard_mode(self):
+        with patch.object(dependencies, "setup_wizard", return_value=0) as wizard:
+            self.assertEqual(dependencies.main(["--wizard"]), 0)
+        wizard.assert_called_once_with()
+
+    def test_all_installed_but_unconfigured_goes_directly_to_setup(self):
+        with patch.object(dependencies, "check_dependencies", side_effect=[
+                    dict(self.ready, setup_required=True), self.ready, self.ready]), \
+                patch.object(dependencies, "legacy_widget_state", return_value="absent"), \
+                patch.object(dependencies.subprocess, "run", return_value=result()) as run:
+            self.assertEqual(dependencies.setup_wizard(), 0)
+        self.assertEqual([call.args[0] for call in run.call_args_list], [
+            [dependencies.SETUP, "--apply"], [dependencies.SETUP, "--install-agent-skills"]])
+
+    def test_completed_setup_only_refreshes_agent_instructions(self):
+        with patch.object(dependencies, "check_dependencies", return_value=self.ready), \
+                patch.object(dependencies.subprocess, "run", return_value=result()) as run:
+            self.assertEqual(dependencies.setup_wizard(), 0)
+        self.assertEqual([call.args[0] for call in run.call_args_list], [[dependencies.SETUP, "--install-agent-skills"]])
+
+    def test_unpublished_helper_blocks_all_side_effects(self):
+        self.missing["installable"] = False
+        self.missing["missing"][0].update(name="keycontroller", requirement=dependencies.HELPER_REQUIREMENT,
+                                         available=False, repository=None, reason="repository_unavailable")
+        with patch.object(dependencies, "check_dependencies", return_value=self.missing), \
+                patch.object(dependencies.subprocess, "run") as run:
+            self.assertEqual(dependencies.setup_wizard(), 1)
+        run.assert_not_called()
+        self.assertIn("Wait for publication", self.terminal.getvalue())
+        self.assertNotIn("KeyController is ready.", self.terminal.getvalue())
+
+    def test_repository_policy_blocks_wizard_and_legacy_install_before_any_child(self):
+        for action in (dependencies.setup_wizard, dependencies.install_dependencies):
+            for reason in ("unsupported_repositories", "repository_signatures_disabled"):
+                database = PackageDatabase(["qt6-svg"], {"qt6-svg": ("extra", "6.11.2-1")})
+                if reason == "unsupported_repositories":
+                    database.repositories.append("custom-signed")
+                else:
+                    database.signatures["omarchy"] = "PackageOptional"
+                with self.subTest(action=action.__name__, reason=reason), \
+                        patch.object(dependencies, "query", side_effect=database), \
+                        patch.object(dependencies.subprocess, "run") as run:
+                    self.assertEqual(action(), 1)
+                run.assert_not_called()
+        self.assertNotIn("KeyController is ready.", self.terminal.getvalue())
+
+    def test_cancelled_failed_or_interrupted_install_never_configures(self):
+        for outcome in (result(1), result(130), OSError("no process"), KeyboardInterrupt()):
+            with self.subTest(outcome=outcome), \
+                    patch.object(dependencies, "check_dependencies", return_value=self.missing) as check, \
+                    patch.object(dependencies.subprocess, "run", side_effect=[outcome]) as run:
+                self.assertEqual(dependencies.setup_wizard(), 1)
+                self.assertEqual(check.call_count, 1)
+                self.assertEqual(run.call_count, 1)
+                self.assertEqual(run.call_args.args[0][0], dependencies.SUDO)
+        self.assertNotIn("KeyController is ready.", self.terminal.getvalue())
+
+    def test_package_exit_zero_without_verified_install_does_not_setup(self):
+        with patch.object(dependencies, "check_dependencies", return_value=self.missing), \
+                patch.object(dependencies.subprocess, "run", return_value=result()) as run:
+            self.assertEqual(dependencies.setup_wizard(), 1)
+        self.assertEqual(run.call_count, 1)
+        self.assertIn("dependencies_still_missing", self.terminal.getvalue())
+
+    def test_failed_native_setup_is_not_retried_or_reported_ready(self):
+        for outcome in (result(1), result(130), OSError("no process"), KeyboardInterrupt()):
+            with self.subTest(outcome=outcome), \
+                    patch.object(dependencies, "check_dependencies", return_value=dict(self.ready, setup_required=True)), \
+                    patch.object(dependencies, "legacy_widget_state", return_value="absent"), \
+                    patch.object(dependencies.subprocess, "run", side_effect=[outcome]) as run:
+                self.assertEqual(dependencies.setup_wizard(), 1)
+                self.assertEqual(run.call_count, 1)
+        self.assertNotIn("KeyController is ready.", self.terminal.getvalue())
+
+    def test_zero_setup_exit_requires_complete_receipt_and_enablement(self):
+        for status in [dict(self.ready, setup_required=True), dict(self.ready, migration_required=True), self.missing]:
+            with self.subTest(status=status), \
+                    patch.object(dependencies, "check_dependencies", side_effect=[dict(self.ready, setup_required=True), status]), \
+                    patch.object(dependencies, "legacy_widget_state", return_value="absent"), \
+                    patch.object(dependencies.subprocess, "run", return_value=result()):
+                self.assertEqual(dependencies.setup_wizard(), 1)
+        self.assertNotIn("KeyController is ready.", self.terminal.getvalue())
+
+    def test_incomplete_agent_instructions_after_apply_are_reported_before_success(self):
+        with patch.object(dependencies, "check_dependencies", side_effect=[
+                    dict(self.ready, setup_required=True), self.ready]), \
+                patch.object(dependencies, "legacy_widget_state", return_value="absent"), \
+                patch.object(dependencies.subprocess, "run", side_effect=[result(), result(1)]) as run:
+            self.assertEqual(dependencies.setup_wizard(), 1)
+        self.assertEqual([call.args[0] for call in run.call_args_list], [
+            [dependencies.SETUP, "--apply"], [dependencies.SETUP, "--install-agent-skills"]])
+        self.assertIn("agent_skills_failed", self.terminal.getvalue())
+        self.assertNotIn("KeyController is ready.", self.terminal.getvalue())
+
+    def test_duplicate_wizard_stops_before_metadata_or_any_child(self):
+        with patch.object(dependencies, "installation_lock", side_effect=dependencies.DependencyError("installation_busy")), \
+                patch.object(dependencies, "check_dependencies") as check, \
+                patch.object(dependencies.subprocess, "run") as run:
+            self.assertEqual(dependencies.setup_wizard(), 1)
+        check.assert_not_called()
+        run.assert_not_called()
+        self.assertIn("installation_busy", self.terminal.getvalue())
+
+    def test_wizard_never_runs_as_root_or_without_a_visible_terminal(self):
+        for root, tty in [(True, True), (False, False)]:
+            with self.subTest(root=root, tty=tty), \
+                    patch.object(dependencies.os, "geteuid", return_value=0 if root else 1000), \
+                    patch.object(dependencies.sys, "stdin", Tty("\n") if tty else io.StringIO()), \
+                    patch.object(dependencies, "check_dependencies") as check, \
+                    patch.object(dependencies.subprocess, "run") as run:
+                self.assertEqual(dependencies.setup_wizard(), 1)
+            check.assert_not_called()
+            run.assert_not_called()
+
+    def test_migration_only_does_not_repeat_completed_initial_setup(self):
+        for setup_required in (True, False):
+            with self.subTest(setup_required=setup_required), \
+                    patch.object(dependencies, "check_dependencies", side_effect=[
+                        dict(self.ready, setup_required=setup_required, migration_required=True), self.ready, self.ready]), \
+                    patch.object(dependencies.subprocess, "run", return_value=result()) as run:
+                self.assertEqual(dependencies.setup_wizard(), 0)
+            self.assertEqual([call.args[0] for call in run.call_args_list], [
+                [dependencies.SETUP, "--migrate-brand"], [dependencies.SETUP, "--install-agent-skills"]])
+
+    def test_migration_then_incomplete_receipt_is_completed_once_after_fresh_check(self):
+        with patch.object(dependencies, "check_dependencies", side_effect=[
+                    dict(self.ready, setup_required=True, migration_required=True),
+                    dict(self.ready, setup_required=True), self.ready, self.ready]), \
+                patch.object(dependencies, "legacy_widget_state", return_value="absent") as legacy, \
+                patch.object(dependencies.subprocess, "run", return_value=result()) as run:
+            self.assertEqual(dependencies.setup_wizard(), 0)
+        legacy.assert_called_once_with()
+        self.assertEqual([call.args[0] for call in run.call_args_list], [
+            [dependencies.SETUP, "--migrate-brand"], [dependencies.SETUP, "--apply"],
+            [dependencies.SETUP, "--install-agent-skills"]])
+        self.assertIn("configure the managed SSH agent", self.terminal.getvalue())
+
+    def test_migration_that_keeps_legacy_state_never_runs_apply(self):
+        for status, legacy in [(dict(self.ready, setup_required=True, migration_required=True), "managed"),
+                               (dict(self.ready, setup_required=True), "conflict")]:
+            with self.subTest(status=status, legacy=legacy), \
+                    patch.object(dependencies, "check_dependencies", side_effect=[
+                        dict(self.ready, setup_required=True, migration_required=True), status]), \
+                    patch.object(dependencies, "legacy_widget_state", return_value=legacy), \
+                    patch.object(dependencies.subprocess, "run", return_value=result()) as run:
+                self.assertEqual(dependencies.setup_wizard(), 1)
+                self.assertEqual([call.args[0] for call in run.call_args_list], [[dependencies.SETUP, "--migrate-brand"]])
+
+    def test_final_verification_can_fail_after_previous_success(self):
+        with patch.object(dependencies, "check_dependencies", side_effect=[self.ready, dict(self.ready, setup_required=True)]), \
+                patch.object(dependencies.subprocess, "run", return_value=result()):
+            self.assertEqual(dependencies.setup_wizard(), 1)
+        self.assertIn("setup_incomplete", self.terminal.getvalue())
+        self.assertNotIn("KeyController is ready.", self.terminal.getvalue())
+
+    def test_russian_wizard_phases_and_scope_are_visible(self):
+        with patch.object(dependencies, "system_language", return_value="ru"), \
+                patch.object(dependencies, "check_dependencies", return_value=self.ready), \
+                patch.object(dependencies.subprocess, "run", return_value=result()):
+            self.assertEqual(dependencies.setup_wizard(), 0)
+        self.assertIn("резервной копии", self.terminal.getvalue())
+        self.assertIn("3/3 — Проверка результата", self.terminal.getvalue())
+        self.assertIn("Выйдите из сеанса и войдите снова", self.terminal.getvalue())
+
+
 class ShellBootstrapTests(unittest.TestCase):
     def fixture(self, directory, installed=False, signature="PackageRequired", repository="extra"):
         directory = Path(directory)
         pacman = directory / "pacman"
-        pacman.write_text("#!/bin/sh\ncase \"$1\" in\n-T) " + ("exit 0" if installed else "printf 'python\\n'; exit 127")
+        pacman.write_text("#!/bin/sh\ncase \"$1\" in\n-T) [ \"$2\" = python ] || exit 0; " + ("exit 0" if installed else "printf 'python\\n'; exit 127")
                           + f";;\n-Si) printf 'Repository      : {repository}\\nName            : python\\nVersion         : 3.14.0-1\\n';;\nesac\n")
         pacman.chmod(0o700)
         config = directory / "pacman-conf"
@@ -525,7 +762,7 @@ class ShellBootstrapTests(unittest.TestCase):
         self.assertEqual(json.loads(process.stdout)["error_code"], "python_unavailable")
 
     def test_bootstrap_respects_signatures_and_rejects_repository_injection(self):
-        for signature, repository, expected in [("PackageOptional", "extra", "missing"),
+        for signature, repository, expected in [("PackageOptional", "extra", "error"),
                                                  ("PackageRequired", "extra;evil", "error")]:
             with self.subTest(signature=signature, repository=repository), tempfile.TemporaryDirectory() as directory:
                 launcher = self.fixture(directory, signature=signature, repository=repository)
@@ -577,6 +814,213 @@ class ShellBootstrapTests(unittest.TestCase):
             # Python would exit 99 if called: remaining dependencies are only
             # checked/installed after the panel has shown their complete list.
             self.assertTrue(python.exists())
+
+
+class WizardBootstrapTests(unittest.TestCase):
+    def fixture(self, directory, helper="available", outcome=0, completion=0):
+        directory = Path(directory)
+        python = directory / "bootstrap-python"
+        events = directory / "events"
+        argv = directory / "argv"
+        payload = directory / "python-payload"
+        lock = directory / "keycontroller-dependencies.lock"
+        payload.write_text(f"""#!/usr/bin/python3
+import fcntl, json, os, sys
+with open({str(events)!r}, 'a') as stream:
+    stream.write('python-wizard\\n')
+with open({str(argv)!r}, 'w') as stream:
+    json.dump(sys.argv[1:], stream)
+try:
+    os.fstat(9)
+except OSError:
+    pass
+else:
+    sys.exit(91)
+with open({str(lock)!r}, 'r') as stream:
+    fcntl.flock(stream, fcntl.LOCK_EX | fcntl.LOCK_NB)
+sys.exit({completion})
+""")
+        payload.chmod(0o700)
+        pacman = directory / "pacman"
+        pacman.write_text(f"""#!/bin/sh
+printf '%s\\n' "$*" >> '{events}'
+case "$1" in
+    -T)
+        if [ "$2" = python ]; then
+            [ -x '{python}' ] && exit 0
+            printf 'python\\n'; exit 127
+        fi
+        if [ "$2" = 'keycontroller>=0.1.0-24' ]; then
+            {'exit 0' if helper == 'installed' else "printf 'keycontroller>=0.1.0-24\\n'; exit 127"}
+        fi
+        exit 2 ;;
+    -Si)
+        if [ "$2" = python ]; then
+            printf 'Repository : extra\\nName : python\\nVersion : 3.14.0-1\\n'
+        elif [ "$2" = keycontroller ]; then
+            {'exit 1' if helper == 'absent' else "printf 'Repository : omarchy\\nName : keycontroller\\nVersion : 0.1.0-24\\n'"}
+        else exit 2; fi ;;
+    -S)
+        [ {outcome} = 0 ] || exit {outcome}
+        cp '{payload}' '{python}'; chmod 700 '{python}' ;;
+    *) exit 2 ;;
+esac
+""")
+        pacman.chmod(0o700)
+        config = directory / "pacman-conf"
+        override = "[ \"$2\" != omarchy ] || printf 'PackageOptional\\n'" if helper == "unsigned" else ":"
+        config.write_text(f"""#!/bin/sh
+case "$1" in
+    --repo-list) printf 'core\\nextra\\nomarchy\\n' ;;
+    SigLevel) printf 'PackageRequired\\nPackageTrustedOnly\\n' ;;
+    --repo) {override} ;;
+esac
+""")
+        config.chmod(0o700)
+        vercmp = directory / "vercmp"
+        vercmp.write_text("#!/bin/sh\n" + ("printf '%s\\n' -1\n" if helper == "old" else "printf '0\\n'\n"))
+        vercmp.chmod(0o700)
+        sudo = directory / "sudo"
+        sudo.write_text(f"#!/bin/sh\nprintf 'sudo\\n' >> '{events}'\nexec \"$@\"\n")
+        sudo.chmod(0o700)
+        source = (ROOT / "plugin/dependencies").read_text()
+        for name, executable in [("PYTHON", python), ("PACMAN", pacman), ("PACMAN_CONF", config),
+                                  ("VERCMP", vercmp), ("SUDO", sudo)]:
+            source = re.sub(r"^" + name + r"=.*$", name + "=" + str(executable), source, flags=re.M)
+        source = source.replace("runtime=/run/user/$uid", "runtime=" + str(directory))
+        launcher = directory / "dependencies"
+        launcher.write_text(source)
+        return launcher, events, argv
+
+    def run_wizard(self, launcher, mode="--wizard"):
+        master, slave = pty.openpty()
+        process = None
+        try:
+            process = subprocess.Popen(["/bin/sh", str(launcher), mode],
+                                       stdin=slave, stdout=slave, stderr=slave)
+            os.write(master, b"\n")
+            return process.wait(timeout=5)
+        finally:
+            if process is not None and process.poll() is None:
+                process.kill()
+                process.wait()
+            os.close(master)
+            os.close(slave)
+
+    def test_partial_check_includes_helper_and_blocks_unavailable_combined_install(self):
+        for helper, available in [("available", True), ("absent", False), ("old", False)]:
+            with self.subTest(helper=helper), tempfile.TemporaryDirectory() as directory:
+                launcher, events, argv = self.fixture(directory, helper=helper)
+                process = subprocess.run(["/bin/sh", str(launcher), "--check", "--json"],
+                                         capture_output=True, text=True)
+                self.assertEqual(process.returncode, 0, process.stderr)
+                status = json.loads(process.stdout)
+                self.assertFalse(status["complete"])
+                self.assertEqual(status["installable"], available)
+                self.assertEqual([item["name"] for item in status["missing"]], ["python", "keycontroller"])
+                self.assertEqual(status["missing"][0]["repository"], "extra")
+                self.assertTrue(status["missing"][0]["available"])
+                self.assertEqual(status["missing"][1]["available"], available)
+                self.assertEqual(status["missing"][1]["requirement"], dependencies.HELPER_REQUIREMENT)
+                self.assertNotIn("sudo", events.read_text().splitlines())
+                self.assertFalse(argv.exists())
+
+    def test_repository_policy_blocks_check_wizard_and_legacy_python_bootstrap(self):
+        for policy in ("third-party", "unsigned-other-repo"):
+            with self.subTest(policy=policy), tempfile.TemporaryDirectory() as directory:
+                helper = "unsigned" if policy == "unsigned-other-repo" else "available"
+                launcher, events, argv = self.fixture(directory, helper=helper)
+                if policy == "third-party":
+                    config = Path(directory) / "pacman-conf"
+                    config.write_text(config.read_text().replace("--repo-list) printf '",
+                                                                "--repo-list) printf 'custom-signed\\n"))
+                process = subprocess.run(["/bin/sh", str(launcher), "--check", "--json"],
+                                         capture_output=True, text=True)
+                self.assertEqual(process.returncode, 1, process.stderr)
+                status = json.loads(process.stdout)
+                self.assertEqual(status["state"], "error")
+                expected = "unsupported_repositories" if policy == "third-party" else "repository_signatures_disabled"
+                self.assertEqual(status["error_code"], expected)
+                self.assertFalse(status["installable"])
+                for mode in ("--wizard", "--install"):
+                    self.assertEqual(self.run_wizard(launcher, mode), 1)
+                self.assertNotIn("sudo", events.read_text().splitlines())
+                self.assertFalse(argv.exists())
+
+    def test_signed_python_bootstrap_continues_in_same_terminal_and_releases_fd9(self):
+        with tempfile.TemporaryDirectory() as directory:
+            launcher, events, argv = self.fixture(directory)
+            self.assertEqual(self.run_wizard(launcher), 0)
+            invocations = events.read_text().splitlines()
+            self.assertEqual(invocations.count("sudo"), 1)
+            self.assertEqual([entry for entry in invocations if entry.startswith("-S ")], ["-S --needed -- extra/python"])
+            self.assertEqual(invocations[-1], "python-wizard")
+            self.assertLess(invocations.index("-Si keycontroller"), invocations.index("sudo"))
+            self.assertEqual(json.loads(argv.read_text()), ["-I", str(Path(directory) / "dependencies.py"), "--wizard"])
+
+    def test_missing_unsigned_or_old_helper_blocks_even_python_install(self):
+        for helper in ("absent", "unsigned", "old"):
+            with self.subTest(helper=helper), tempfile.TemporaryDirectory() as directory:
+                launcher, events, argv = self.fixture(directory, helper=helper)
+                self.assertEqual(self.run_wizard(launcher), 1)
+                self.assertNotIn("sudo", events.read_text().splitlines())
+                self.assertFalse(argv.exists())
+
+    def test_failed_or_cancelled_python_transaction_never_executes_wizard(self):
+        for outcome in (1, 130):
+            with self.subTest(outcome=outcome), tempfile.TemporaryDirectory() as directory:
+                launcher, events, argv = self.fixture(directory, outcome=outcome)
+                self.assertEqual(self.run_wizard(launcher), 1)
+                self.assertEqual(events.read_text().splitlines().count("sudo"), 1)
+                self.assertFalse(argv.exists())
+
+    def test_successful_transaction_without_interpreter_cannot_continue(self):
+        with tempfile.TemporaryDirectory() as directory:
+            launcher, events, argv = self.fixture(directory)
+            pacman = Path(directory) / "pacman"
+            source = pacman.read_text()
+            source = re.sub(r"        cp .*chmod 700 .* ;;", "        : ;;", source)
+            pacman.write_text(source)
+            self.assertEqual(self.run_wizard(launcher), 1)
+            self.assertEqual(events.read_text().splitlines().count("sudo"), 1)
+            self.assertFalse(argv.exists())
+
+    def test_exec_preserves_nonzero_wizard_result(self):
+        with tempfile.TemporaryDirectory() as directory:
+            launcher, events, argv = self.fixture(directory, helper="installed", completion=7)
+            self.assertEqual(self.run_wizard(launcher), 7)
+            self.assertNotIn("-Si keycontroller", events.read_text().splitlines())
+            self.assertTrue(argv.exists())
+
+    def test_session_and_custom_config_reach_only_unprivileged_handoff(self):
+        with tempfile.TemporaryDirectory() as directory:
+            directory = Path(directory)
+            launcher, events, argv = self.fixture(directory)
+            sudo = directory / "sudo"
+            privileged = directory / "privileged-env"
+            handoff = directory / "handoff-env"
+            sudo.write_text(sudo.read_text().replace('exec "$@"',
+                f"printf '%s\\n' \"${{WAYLAND_DISPLAY-unset}}\" \"${{CODEX_HOME-unset}}\" > '{privileged}'\nexec \"$@\""))
+            payload = directory / "python-payload"
+            payload.write_text(payload.read_text().replace("sys.exit(0)",
+                f"with open({str(handoff)!r}, 'w') as stream:\n"
+                "    json.dump([os.environ.get('WAYLAND_DISPLAY'), os.environ.get('CODEX_HOME')], stream)\n"
+                "sys.exit(0)"))
+            with patch.dict(os.environ, {"WAYLAND_DISPLAY": "test-wayland", "CODEX_HOME": "/tmp/test-codex"}):
+                self.assertEqual(self.run_wizard(launcher), 0)
+            self.assertEqual(privileged.read_text().splitlines(), ["unset", "unset"])
+            self.assertEqual(json.loads(handoff.read_text()), ["test-wayland", "/tmp/test-codex"])
+
+    def test_duplicate_bootstrap_never_starts_transaction(self):
+        with tempfile.TemporaryDirectory() as directory:
+            launcher, events, argv = self.fixture(directory)
+            lock = Path(directory) / "keycontroller-dependencies.lock"
+            lock.touch(mode=0o600)
+            with lock.open() as lease:
+                fcntl.flock(lease, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                self.assertEqual(self.run_wizard(launcher), 1)
+            self.assertNotIn("sudo", events.read_text().splitlines())
+            self.assertFalse(argv.exists())
 
 
 if __name__ == "__main__":

@@ -22,11 +22,17 @@ ColumnLayout {
   property bool launchPending: false
   property bool received: false
   property bool checking: false
-  readonly property bool ready: !monitoringEnabled || (status === "ready" && !setupRequired)
+  property bool reportReady: false
+  readonly property bool ready: !monitoringEnabled || reportReady
+  readonly property bool helperUnavailable: status === "missing" && missing.some(function(item) {
+    return item.name === "keycontroller" && !item.available && item.reason === "repository_unavailable"
+  })
+  readonly property string packageStatusUrl: "https://github.com/omacom/omarchy-pkgs/pull/857"
   readonly property string script: decodeURIComponent(Qt.resolvedUrl("dependencies").toString().replace(/^file:\/\//, ""))
   signal languageDetected(string language)
   function t(source) { return KeyLocale.text(uiLanguage, source) }
   function fail(code) {
+    reportReady = false
     status = "error"
     errorCode = code
     installable = false
@@ -35,7 +41,8 @@ ColumnLayout {
   function accept(reply) {
     if (!reply || reply.schema_version !== 1 || ["ready", "missing", "error"].indexOf(reply.state) < 0
         || ["ru", "en"].indexOf(reply.ui_language) < 0 || !Array.isArray(reply.missing)
-        || typeof reply.installable !== "boolean" || typeof reply.installing !== "boolean")
+        || typeof reply.installable !== "boolean" || typeof reply.installing !== "boolean"
+        || typeof reply.setup_required !== "boolean" || typeof reply.migration_required !== "boolean")
       throw new Error("Invalid dependency status")
     if (reply.missing.length > 20 || reply.missing.some(function(item) {
       return !item || typeof item.name !== "string" || !/^[a-z0-9][a-z0-9+_.-]*$/.test(item.name)
@@ -48,11 +55,14 @@ ColumnLayout {
     if (JSON.stringify(missing) !== JSON.stringify(reply.missing)) missing = reply.missing
     installable = reply.installable
     installing = reply.installing
-    setupRequired = reply.state === "ready" && reply.setup_required === true
+    setupRequired = reply.state === "ready" && (reply.setup_required || reply.migration_required)
     errorCode = reply.error_code || ""
     if (installing || Date.now() >= launchUntil || (reply.state === "ready" && !setupRequired)) launchPending = false
     // A background recheck must not remove and recreate the key controls.
     status = reply.state
+    // Publish readiness once the entire report has been validated/applied.
+    // An intermediate assignment must not refresh the API during setup.
+    reportReady = reply.state === "ready" && !setupRequired && !reply.installing
   }
   function check() {
     if (!monitoringEnabled || checking || probe.running) return
@@ -80,8 +90,11 @@ ColumnLayout {
   function runInstall() {
     // A visible original terminal owns sudo/Pacman's prompts. No password is
     // accepted by QML, nor is plugin-supplied Python ever executed as root.
-    launcher.command = ["/usr/bin/omarchy", "launch", "terminal", "/bin/sh", script, setupRequired ? "--setup" : "--install"]
+    launcher.command = wizardCommand()
     launcher.running = true
+  }
+  function wizardCommand() {
+    return ["/usr/bin/omarchy", "launch", "terminal", "/bin/sh", script, "--wizard"]
   }
   function reason(item) {
     if (item.available) return item.repository || root.t("Системный репозиторий")
@@ -142,12 +155,25 @@ ColumnLayout {
     objectName: "ssh-keys-install-dependencies"
     Layout.fillWidth: true
     implicitHeight: Style.space(42)
-    text: root.installing || root.launchPending ? root.t("Установка в терминале…")
-      : root.status === "checking" ? root.t("Проверка пакетов…") : root.setupRequired ? root.t("Настроить KeyController") : root.t("Установить пакеты")
+    text: root.installing || root.launchPending ? root.t("Настройка в терминале…")
+      : root.status === "checking" ? root.t("Проверка пакетов…")
+      : root.helperUnavailable ? root.t("Пакет пока недоступен")
+      : root.setupRequired ? root.t("Настроить KeyController") : root.t("Установить и настроить")
     iconText: root.installing || root.launchPending || root.status === "checking" ? "\uf110" : "\uf019"
     busy: root.installing || root.launchPending || root.status === "checking"
     enabled: (root.installable || root.setupRequired) && !root.checking && !root.installing && !root.launchPending
     onClicked: root.install()
+  }
+  Text {
+    objectName: "ssh-keys-setup-scope"
+    Layout.fillWidth: true
+    visible: root.installable || root.setupRequired || root.installing || root.launchPending
+    text: root.t("Мастер установит нужные пакеты, подключит основной SSH-агент и инструкции для ИИ. Настройки сохранятся в резервной копии; исключения для отдельных серверов останутся.")
+    textFormat: Text.PlainText
+    wrapMode: Text.Wrap
+    font.family: Style.font.family
+    font.pixelSize: Style.font.bodySmall
+    color: Util.alpha(Color.popups.text, 0.65)
   }
   BorderSurface {
     Layout.fillWidth: true
@@ -192,21 +218,30 @@ ColumnLayout {
     }
   }
   Text {
+    objectName: "ssh-keys-dependencies-message"
     Layout.fillWidth: true
     visible: text !== ""
     text: root.errorCode === "terminal_unavailable" ? root.t("Не удалось открыть терминал")
-      : root.errorCode === "python_required" ? root.t("Сначала установите Python, затем проверим остальные пакеты")
+      : root.errorCode === "unsupported_repositories" ? root.t("Автоматическая установка доступна со штатными репозиториями Omarchy/Arch. Обнаружены другие репозитории; их настройки не изменены.")
+      : root.errorCode === "repository_signatures_disabled" ? root.t("Все подключённые репозитории должны требовать доверенную подпись пакетов.")
+      : root.helperUnavailable ? root.t("Системный пакет keycontroller пока недоступен в подключённых репозиториях. После его появления нажмите «Проверить снова».")
+      : root.errorCode === "python_required" ? root.t("Мастер начнёт с Python, затем проверит остальные пакеты и продолжит настройку")
       : root.status === "error" ? root.t("Не удалось проверить пакеты")
-      : root.setupRequired ? root.t("Подключить управляемый SSH-агент и инструкции для ИИ")
-      : root.missing.some(function(item) { return item.name === "keycontroller" && !item.available })
-        ? root.t("Установите системный пакет keycontroller из выпуска KeyController")
       : root.missing.some(function(item) { return !item.available }) ? root.t("Проверьте репозитории и обновления системы")
-      : root.status === "missing" ? root.t("Установка откроется в терминале. Полный список покажет Pacman") : ""
+      : root.setupRequired || root.status === "missing" ? root.t("Следуйте подсказкам мастера. Команды вводить не нужно.") : ""
     textFormat: Text.PlainText
     wrapMode: Text.Wrap
     font.family: Style.font.family
     font.pixelSize: Style.font.bodySmall
     color: Util.alpha(Color.popups.text, 0.65)
+  }
+  KeyAction {
+    objectName: "ssh-keys-package-status"
+    visible: root.helperUnavailable
+    text: root.t("Статус публикации пакета")
+    iconText: "\uf08e"
+    bordered: false
+    onClicked: Qt.openUrlExternally(root.packageStatusUrl)
   }
   KeyAction {
     visible: root.status !== "checking"
