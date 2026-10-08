@@ -114,6 +114,9 @@ struct Fixture {
     assert(prompt->screen() &&
            prompt->height() <= prompt->screen()->availableGeometry().height());
     const auto *scroll = prompt->findChild<QScrollArea *>();
+    if (scroll && scroll->widget()->width() > scroll->viewport()->width())
+      std::fprintf(stderr, "Prompt layout overflow: dialog=%dx%d body=%d viewport=%d\n",
+          prompt->width(), prompt->height(), scroll->widget()->width(), scroll->viewport()->width());
     assert(scroll && scroll->widget()->width() <= scroll->viewport()->width());
     for (auto *label : prompt->findChildren<QLabel *>())
       assert(label->textFormat() == Qt::PlainText);
@@ -299,17 +302,28 @@ void fingerprintDoesNotStartAfterEarlyCancellationEofOrTerminalFrame() {
 void compactUnlockRetainsIdentityAndRequestProvenance() {
   Fixture test(false);
   auto request = job();
+  const QString fingerprint = QStringLiteral("SHA256:") + QString(43, 'W');
+  auto key = request.value("key").toObject();
+  key["fingerprint"] = fingerprint;
+  request["key"] = key;
   request["caller"] = "/usr/lib/ssh-keys/panel-client (PID 1234)";
   request["reason"] = QStringLiteral("Запрос из панели KeyController");
   test.message(request);
   assert(test.reply().value("mode") == "fingerprint");
   const auto description = test.control<QLabel>("request-details")->text();
-  assert(description == QStringLiteral("Запрос: KeyController"));
-  assert(!test.control<QLabel>("metadata")->isVisible());
+  assert(description == QStringLiteral("Запрос через: panel-client\nЗапрос из панели KeyController"));
+  assert(test.control<QLabel>("metadata")->isVisible());
+  const auto *identity = test.control<QLabel>("metadata");
+  assert(QString(identity->text()).remove('\n').contains(fingerprint));
+  for (const auto &line : identity->text().split('\n')) {
+    if (line.contains(QStringLiteral("Срок доступа:"))) break;
+    assert(identity->fontMetrics().horizontalAdvance(line) <= identity->width());
+  }
+  assert(test.control<QLabel>("metadata")->text().contains(QStringLiteral("Срок доступа: 30 мин")));
   assert(!test.control<QLabel>("details")->isVisible());
   test.click("details-toggle");
   const auto details = test.control<QLabel>("details")->text();
-  assert(details.contains("SHA256:disposable") && details.contains("/test/.ssh/key"));
+  assert(details.contains(fingerprint) && details.contains("/test/.ssh/key"));
   assert(details.contains(QStringLiteral("Срок доступа: 30 мин")));
   assert(details.contains("/usr/lib/ssh-keys/panel-client (PID 1234)"));
   test.compact();
@@ -750,6 +764,167 @@ void malformedSettingsTargetsFailClosedAndCancellationDoesNotApprove() {
   }
 }
 
+QJsonObject policyJob(bool global) {
+  auto request = job(global ? "settings.global" : "settings.key");
+  if (global) {
+    request["key"] = QJsonValue(QJsonValue::Null);
+    request["value"] = QJsonObject{{"lifetime_seconds", 1800}, {"revoke_on_sleep", false}};
+  } else {
+    request["value"] = QJsonObject{{"inherits", true}, {"lifetime_seconds", 1800},
+                                    {"global_lifetime_seconds", 3600}};
+  }
+  return request;
+}
+
+void policyEditorSavesOnlyNativeSelectionsAndNeverAuthenticates() {
+  for (const auto &language : {"ru", "en"}) {
+    qputenv("SSH_KEYS_UI_LANGUAGE", language);
+    for (bool global : {true, false}) {
+      Fixture test(false);
+      test.message(policyJob(global));
+      test.noReply();
+      test.secretsHiddenAndEmpty();
+      test.compact();
+      assert(!indicator(test)->isRunning());
+      assert(test.control<QWidget>("policy-editor")->isVisible());
+      assert(test.control<QPushButton>("consent")->text() ==
+          (QByteArray(language) == "ru" ? QStringLiteral("Сохранить") : QStringLiteral("Save")));
+      auto *preset = test.control<QComboBox>("policy-lifetime");
+      auto *inherit = test.control<QCheckBox>("policy-inherit");
+      auto *sleep = test.control<QCheckBox>("policy-sleep");
+      assert(inherit->isVisible() == !global && sleep->isVisible() == global);
+      if (!global) {
+        assert(inherit->isChecked() && !preset->isEnabled());
+        assert(test.control<QLabel>("policy-inherited-duration")->text().contains("1"));
+        inherit->setChecked(false);
+        assert(preset->isEnabled());
+        assert(test.control<QLabel>("metadata")->isVisible());
+        assert(test.control<QLabel>("metadata")->text().contains("SHA256:disposable"));
+      } else sleep->setChecked(true);
+      // Metadata/progress from the peer cannot authorize a policy or restart PAM.
+      test.message({{"state", "progress"}, {"phase", "fingerprint_waiting"}});
+      assert(!indicator(test)->isRunning());
+      preset->setCurrentIndex(preset->findData(900));
+      test.noReply();
+      test.click("consent");
+      const QJsonObject value = global
+          ? QJsonObject{{"lifetime_seconds", 900}, {"revoke_on_sleep", true}}
+          : QJsonObject{{"inherits", false}, {"lifetime_seconds", 900}};
+      assert((test.reply() == QJsonObject{{"consent", true}, {"mode", "settings"},
+          {"passphrase", ""}, {"confirmation", ""}, {"value", value}}));
+      assert(!test.control<QWidget>("policy-editor")->isEnabled());
+      test.click("consent");
+      test.noReply();
+      test.secretsHiddenAndEmpty();
+      test.message({{"state", "completed"}});
+      assert(!indicator(test)->isRunning());
+      assert(test.control<QLabel>("status")->text() ==
+          (QByteArray(language) == "ru" ? QStringLiteral("Изменения отправлены")
+                                        : QStringLiteral("Changes submitted")));
+      test.noReply(true);
+    }
+  }
+  qputenv("SSH_KEYS_UI_LANGUAGE", "ru");
+}
+
+void policyEditorPreservesExactCustomDurationInheritanceAndCancellation() {
+  for (int seconds : {0, 45, 31536000}) {
+    for (bool inherited : {false, true}) {
+      Fixture test;
+      auto request = policyJob(false);
+      request["value"] = QJsonObject{{"inherits", inherited}, {"lifetime_seconds", seconds},
+                                     {"global_lifetime_seconds", 300}};
+      test.message(request);
+      test.noReply();
+      auto *custom = test.control<QSpinBox>("policy-custom-seconds");
+      assert(custom->isVisible() == (seconds != 0 && !inherited));
+      if (seconds != 0) assert(custom->value() == seconds);
+      test.compact();
+      test.click("consent");
+      assert((test.reply().value("value").toObject() ==
+              QJsonObject{{"inherits", inherited}, {"lifetime_seconds", seconds}}));
+    }
+  }
+  for (bool global : {true, false}) {
+    Fixture test;
+    test.message(policyJob(global));
+    auto *preset = test.control<QComboBox>("policy-lifetime");
+    if (!global) test.control<QCheckBox>("policy-inherit")->setChecked(false);
+    preset->setCurrentIndex(preset->findData(-1));
+    auto *custom = test.control<QSpinBox>("policy-custom-seconds");
+    assert(custom->isVisible());
+    custom->setValue(77);
+    test.noReply();
+    test.click("cancel");
+    assert((test.reply() == QJsonObject{{"consent", false}, {"mode", ""},
+                                      {"passphrase", ""}, {"confirmation", ""}}));
+    assert(!test.prompt->isVisible());
+  }
+  {
+    Fixture test;
+    test.message(policyJob(false));
+    test.control<QCheckBox>("policy-inherit")->setChecked(false);
+    auto *preset = test.control<QComboBox>("policy-lifetime");
+    preset->setCurrentIndex(preset->findData(-1));
+    test.control<QSpinBox>("policy-custom-seconds")->setValue(77);
+    test.click("consent");
+    assert((test.reply().value("value").toObject() ==
+            QJsonObject{{"inherits", false}, {"lifetime_seconds", 77}}));
+  }
+}
+
+void policyEditorRejectsMalformedSnapshotsAndLateReplacement() {
+  for (bool global : {true, false}) {
+    auto valid = policyJob(global);
+    QList<QJsonValue> invalid{QJsonValue(QJsonValue::Null), true, "policy", QJsonObject{}};
+    for (const auto &seconds : {QJsonValue(-1), QJsonValue(0.5), QJsonValue(31536001), QJsonValue("900")}) {
+      auto value = valid.value("value").toObject();
+      value["lifetime_seconds"] = seconds;
+      invalid.append(value);
+    }
+    auto unknown = valid.value("value").toObject();
+    unknown["unknown"] = true;
+    invalid.append(unknown);
+    auto invalidBool = valid.value("value").toObject();
+    invalidBool[global ? "revoke_on_sleep" : "inherits"] = "true";
+    invalid.append(invalidBool);
+    if (!global) {
+      auto invalidGeneral = valid.value("value").toObject();
+      invalidGeneral["global_lifetime_seconds"] = -1;
+      invalid.append(invalidGeneral);
+    }
+    for (const auto &value : invalid) {
+      Fixture test;
+      auto request = valid;
+      request["value"] = value;
+      test.message(request);
+      assert(!test.prompt->isVisible());
+      test.click("consent");
+      test.noReply(true);
+      test.secretsHiddenAndEmpty();
+    }
+    {
+      Fixture test;
+      auto request = valid;
+      request["key"] = global ? QJsonValue(QJsonObject{{"name", "extra key"}})
+                               : QJsonValue(QJsonValue::Null);
+      test.message(request);
+      assert(!test.prompt->isVisible());
+      test.noReply(true);
+    }
+    {
+      Fixture test;
+      test.message(valid);
+      auto replacement = valid;
+      replacement["value"] = QJsonObject{{"lifetime_seconds", 0}, {"revoke_on_sleep", false}};
+      test.message(replacement);
+      assert(!test.control<QPushButton>("consent")->isEnabled());
+      test.click("consent");
+      test.noReply(true);
+    }
+  }
+}
+
 void passwordFieldsDoNotExportClipboardOrAccessibleText() {
   Fixture test;
   test.message(job("encrypt"));
@@ -834,7 +1009,7 @@ void englishUnlockPreservesMetadataAndCompactLayout() {
     test.message(request);
     assert(test.prompt->windowTitle() == QStringLiteral("KeyController — access confirmation"));
     assert(test.control<QLabel>("request-details")->text() ==
-           QStringLiteral("Requested by: client\nПроверить <literal> caller text"));
+           QStringLiteral("Request via: client\nПроверить <literal> caller text"));
     const auto details = test.control<QLabel>("details")->text();
     assert(details.contains("SHA256:disposable\n/test/.ssh/key"));
     assert(details.contains(QStringLiteral("Access duration: ") + scenario.second));
@@ -853,8 +1028,8 @@ void englishUnlockPreservesMetadataAndCompactLayout() {
     request["caller"] = "/usr/lib/ssh-keys/panel-client (PID 1234)";
     request["reason"] = reason;
     test.message(request);
-    const auto expected = QStringLiteral("Requested by: KeyController") +
-        (reason == QStringLiteral("Caller-defined reason") ? "\n" + reason : QString());
+    const auto expected = QStringLiteral("Request via: panel-client") +
+        (reason.isEmpty() ? QString() : "\n" + reason);
     assert(test.control<QLabel>("request-details")->text() == expected);
     test.noReply();
   }
@@ -1105,6 +1280,9 @@ int main(int argc, char **argv) {
   closedPeerClearsEnteredSecretsAndClosesPrompt();
   settingsConfirmExactTargetsWithoutSecretFields();
   malformedSettingsTargetsFailClosedAndCancellationDoesNotApprove();
+  policyEditorSavesOnlyNativeSelectionsAndNeverAuthenticates();
+  policyEditorPreservesExactCustomDurationInheritanceAndCancellation();
+  policyEditorRejectsMalformedSnapshotsAndLateReplacement();
   passwordFieldsDoNotExportClipboardOrAccessibleText();
   themeFilesAreBoundedAndCannotInjectStyles();
   localeSelectionIsStrictAndFixedForEachPrompt();

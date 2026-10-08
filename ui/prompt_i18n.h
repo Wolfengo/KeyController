@@ -71,6 +71,16 @@ enum class Message {
   EnterPassphrase,
   EnterNonemptyPassphrase,
   PassphraseMismatch,
+  GeneralSettings,
+  KeySettings,
+  Save,
+  InheritSettings,
+  RevokeOnSleep,
+  DurationLabel,
+  CustomDuration,
+  GeneralLifetime,
+  SettingsExplanation,
+  ChangesSubmitted,
   Count
 };
 struct Entry { const char *russian; const char *english; };
@@ -126,12 +136,22 @@ inline constexpr Entry catalog[] = {
   {"Изменится выбранный файл; публичный ключ сохранится. Старые копии и снимки диска останутся незашифрованными.", "The selected file will change; its public key will stay the same. Existing copies and disk snapshots will remain unencrypted."},
   {"Привязать", "Link"},
   {"После привязки ключ останется закрытым.", "The key will remain locked after linking."},
-  {"Запрос: ", "Requested by: "},
+  {"Запрос через: ", "Request via: "},
   {"Выполняется…", "Working…"},
   {"Установить пароль", "Set passphrase"},
   {"Введите пароль этого SSH-ключа.", "Enter this SSH key’s passphrase."},
   {"Введите непустой пароль SSH-ключа.", "Enter a nonempty SSH key passphrase."},
   {"Пароли не совпадают.", "Passphrases do not match."},
+  {"Общие настройки", "General settings"},
+  {"Настройки ключа", "Key settings"},
+  {"Сохранить", "Save"},
+  {"Наследовать общие настройки", "Use general settings"},
+  {"Отзывать перед сном", "Revoke before sleep"},
+  {"Срок доступа", "Access duration"},
+  {"Другой срок…", "Custom duration…"},
+  {"Общий срок: ", "General duration: "},
+  {"Новый срок применяется при следующей разблокировке. Текущий доступ сохранит свой срок.", "The new duration applies on the next unlock. Current access keeps its duration."},
+  {"Изменения отправлены", "Changes submitted"},
 };
 static_assert(sizeof(catalog) / sizeof(catalog[0]) == static_cast<std::size_t>(Message::Count));
 inline QString translate(Language language, Message message) {

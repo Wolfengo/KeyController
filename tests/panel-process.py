@@ -10,7 +10,7 @@ import tempfile
 root = Path(__file__).resolve().parent.parent
 reply = {
     'api_version': 1, 'state': 'ready', 'error_code': None, 'key_id': None,
-    'request_id': None, 'expires_at': None, 'active_request': None, 'scanned': True,
+    'request_id': None, 'expires_at': None, 'active_request': None, 'scanned': True, 'scan_root': '/test/.ssh', 'scan_requires_consent': False,
     'session_available': True, 'ui_language': 'ru',
     'global_rules': {'lifetime_seconds': 0, 'revoke_on_sleep': False},
     'keys': [{

@@ -1,5 +1,5 @@
 #!/usr/bin/python3
-"""Optional Wayland timer/inheritance regression; no visible popup or real API."""
+"""Optional Wayland policy-editor launcher regression; no real API."""
 import os
 from pathlib import Path
 import shutil

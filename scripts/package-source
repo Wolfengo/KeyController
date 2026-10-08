@@ -1,44 +1,109 @@
 #!/usr/bin/python3
+"""Export deterministic source/widget archives, never publish or sign a release."""
+import gzip
 import hashlib
+import io
 import json
+import os
 from pathlib import Path
+import re
 import subprocess
 import sys
 import tarfile
 import tempfile
 import tomllib
 
-root = Path(__file__).resolve().parent.parent
+ROOT = Path(__file__).resolve().parent.parent
+SOURCE_PATHS = (
+    '.github',
+    'Cargo.toml', 'Cargo.lock', 'build.rs', 'CMakeLists.txt', 'LICENSE',
+    'README.md', 'preview.png', 'manifest.json', 'src', 'ui', 'plugin',
+    'packaging', 'skills', 'docs', 'tests', 'scripts',
+)
+EPOCH_FILE = '.source-date-epoch'
 
 
-def source_file(item):
+def source_epoch(root=ROOT):
+    value = os.environ.get('SOURCE_DATE_EPOCH')
+    if value is None:
+        marker = root / EPOCH_FILE
+        if marker.is_file() and not marker.is_symlink():
+            value = marker.read_text().strip()
+        else:
+            try:
+                value = subprocess.run(
+                    ['git', '-C', str(root), 'log', '-1', '--format=%ct'],
+                    check=True, capture_output=True, text=True,
+                    timeout=5, env={'PATH': '/usr/bin', 'LC_ALL': 'C'},
+                ).stdout.strip()
+            except (OSError, subprocess.SubprocessError):
+                raise ValueError('Set SOURCE_DATE_EPOCH when exporting a non-Git source tree') from None
+    if not re.fullmatch(r'[0-9]{1,10}', value) or int(value) > 0xFFFFFFFF:
+        raise ValueError('SOURCE_DATE_EPOCH must be an unsigned 32-bit timestamp')
+    return int(value)
+
+
+def source_file(item, epoch):
+    """Normalize metadata; unsupported filesystem objects fail the export."""
     path = Path(item.name)
     if '__pycache__' in path.parts or path.suffix in ('.pyc', '.pyo'):
         return None
+    if not (item.isfile() or item.isdir()):
+        raise ValueError(f'Unsupported source file type: {item.name}')
+    item.uid = item.gid = 0
+    item.uname = item.gname = ''
+    item.mtime = epoch
+    item.mode = 0o755 if item.isdir() or item.mode & 0o111 else 0o644
+    item.pax_headers = {}
     return item
 
 
-version = tomllib.loads((root / 'Cargo.toml').read_text())['package']['version']
-widget_version = json.loads((root / 'manifest.json').read_text())['version']
-dist = root / 'dist'
-dist.mkdir(exist_ok=True)
-archive = dist / f'keycontroller-{version}.tar.gz'
-with tarfile.open(archive, 'w:gz') as output:
-    for name in ('Cargo.toml', 'Cargo.lock', 'build.rs', 'CMakeLists.txt', 'LICENSE', 'README.md', 'preview.png', 'manifest.json', 'src', 'ui', 'plugin', 'packaging', 'skills', 'docs', 'tests', 'scripts'):
-        output.add(root / name, arcname=f'keycontroller-{version}/' + name, filter=source_file)
-checksum = hashlib.sha256(archive.read_bytes()).hexdigest()
-(dist / 'PKGBUILD').write_text((root / 'packaging/PKGBUILD').read_text().replace('SOURCE_SHA256', checksum))
-(dist / 'keycontroller.install').write_text((root / 'packaging/keycontroller.install').read_text())
-with tempfile.TemporaryDirectory(prefix='keycontroller-plugin-') as directory:
-    plugin = Path(directory) / 'org.omarchy.keycontroller'
-    subprocess.run([sys.executable, str(root / 'scripts/package-plugin'), str(plugin)], check=True)
-    with tarfile.open(dist / f'keycontroller-plugin-{widget_version}.tar.gz', 'w:gz') as output:
-        output.add(plugin, arcname=plugin.name)
-with (dist / '.SRCINFO').open('w') as info:
-    subprocess.run(['makepkg', '--printsrcinfo'], cwd=dist, stdout=info, check=True)
-assets = [archive, dist / f'keycontroller-plugin-{widget_version}.tar.gz',
-          dist / 'PKGBUILD', dist / 'keycontroller.install', dist / '.SRCINFO']
-(dist / 'SHA256SUMS').write_text(''.join(
-    hashlib.sha256(path.read_bytes()).hexdigest() + '  ' + path.name + '\n' for path in assets))
-print(archive)
-print('sha256:', checksum)
+def write_archive(destination, directory, prefix, names, epoch, include_epoch=False):
+    # An empty filename avoids leaking the output basename into gzip headers.
+    with destination.open('wb') as raw, gzip.GzipFile(
+            filename='', mode='wb', fileobj=raw, mtime=epoch, compresslevel=9) as compressed:
+        with tarfile.open(fileobj=compressed, mode='w', format=tarfile.PAX_FORMAT) as archive:
+            entries = list(names)
+            if include_epoch:
+                entries.append(EPOCH_FILE)
+            for name in sorted(entries):
+                if include_epoch and name == EPOCH_FILE:
+                    contents = (str(epoch) + '\n').encode('ascii')
+                    marker = tarfile.TarInfo(prefix + '/' + EPOCH_FILE)
+                    marker.size = len(contents)
+                    archive.addfile(source_file(marker, epoch), io.BytesIO(contents))
+                else:
+                    archive.add(directory / name, arcname=prefix + '/' + name,
+                                filter=lambda item: source_file(item, epoch))
+
+
+def main():
+    epoch = source_epoch()
+    version = tomllib.loads((ROOT / 'Cargo.toml').read_text())['package']['version']
+    widget_version = json.loads((ROOT / 'manifest.json').read_text())['version']
+    dist = ROOT / 'dist'
+    dist.mkdir(exist_ok=True)
+    archive = dist / f'keycontroller-{version}.tar.gz'
+    write_archive(archive, ROOT, f'keycontroller-{version}', SOURCE_PATHS, epoch, include_epoch=True)
+    checksum = hashlib.sha256(archive.read_bytes()).hexdigest()
+    (dist / 'PKGBUILD').write_text((ROOT / 'packaging/PKGBUILD').read_text().replace('SOURCE_SHA256', checksum))
+    (dist / 'keycontroller.install').write_bytes((ROOT / 'packaging/keycontroller.install').read_bytes())
+    with tempfile.TemporaryDirectory(prefix='keycontroller-plugin-') as directory:
+        plugin = Path(directory) / 'org.omarchy.keycontroller'
+        subprocess.run([sys.executable, str(ROOT / 'scripts/package-plugin'), str(plugin)], check=True)
+        write_archive(dist / f'keycontroller-plugin-{widget_version}.tar.gz', plugin,
+                      plugin.name, [item.name for item in plugin.iterdir()], epoch)
+    with (dist / '.SRCINFO').open('w') as info:
+        subprocess.run(['makepkg', '--printsrcinfo'], cwd=dist, stdout=info, check=True,
+                       env=dict(os.environ, SOURCE_DATE_EPOCH=str(epoch)))
+    assets = [archive, dist / f'keycontroller-plugin-{widget_version}.tar.gz',
+              dist / 'PKGBUILD', dist / 'keycontroller.install', dist / '.SRCINFO']
+    (dist / 'SHA256SUMS').write_text(''.join(
+        hashlib.sha256(path.read_bytes()).hexdigest() + '  ' + path.name + '\n' for path in assets))
+    print(archive)
+    print('sha256:', checksum)
+    print('SOURCE_DATE_EPOCH:', epoch)
+
+
+if __name__ == '__main__':
+    main()

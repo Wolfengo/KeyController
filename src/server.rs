@@ -5,7 +5,7 @@ use crate::{
     platform::{self, Event, Session, User},
     process,
     protocol::{self, Command},
-    state::{RequestGate, Rules, Settings},
+    state::{GlobalRules, KeyPolicyEdit, RequestGate, Rules, Settings, validate_policy_edit},
     worker::{self, Job},
 };
 use base64::{Engine, engine::general_purpose::STANDARD};
@@ -91,13 +91,100 @@ impl Server {
         )
     }
     fn confirmation_operation(operation: &str) -> bool {
-        matches!(operation, "rules.key" | "unbind")
+        matches!(
+            operation,
+            "rules.key" | "unbind" | "settings.global" | "settings.key"
+        )
     }
     fn operation_key(job: &Job) -> &str {
-        job.key
-            .as_ref()
-            .map(|key| key.id.as_str())
-            .unwrap_or("__scan")
+        job.key.as_ref().map(|key| key.id.as_str()).unwrap_or(
+            if job.operation == "settings.global" {
+                "__settings.global"
+            } else {
+                "__scan"
+            },
+        )
+    }
+    fn editor_value(&self, operation: &str, key: Option<&Key>) -> Result<Value> {
+        match operation {
+            "settings.global" if key.is_none() => Ok(json!(self.settings.global_rules())),
+            "settings.key" => {
+                let key = key.ok_or(Error("key_not_found"))?;
+                Ok(json!({
+                    "inherits": self.settings.keys.get(&key.id).is_none_or(|settings| settings.rules.is_none()),
+                    "lifetime_seconds": self.settings.effective(&key.id).lifetime_seconds,
+                    "global_lifetime_seconds": self.settings.global.lifetime_seconds,
+                }))
+            }
+            _ => Err(Error("invalid_action")),
+        }
+    }
+    fn settings_dialog(&mut self, mut cmd: Command, caller: &str) -> Result<Value> {
+        // The external caller can only open an editor. It cannot supply a
+        // draft, impersonate consent or select a second request to approve.
+        if !cmd.value.is_null() || cmd.request_id.is_some() {
+            return Err(Error("invalid_json"));
+        }
+        if self.active.is_some() {
+            return Err(Error("busy"));
+        }
+        let key = match cmd.action.as_str() {
+            "settings.global" if cmd.key.is_none() => None,
+            "settings.key" => Some(
+                keys::resolve(
+                    &self.inventory,
+                    cmd.key.as_deref().ok_or(Error("key_not_found"))?,
+                )?
+                .clone(),
+            ),
+            _ => return Err(Error("invalid_json")),
+        };
+        cmd.value = self.editor_value(&cmd.action, key.as_ref())?;
+        let operation = cmd.action.clone();
+        self.request(key, &operation, &cmd, caller)
+    }
+    fn commit_editor(&mut self, job: &Job, result: &Value) -> Result<()> {
+        // Job.value is the service-owned snapshot displayed by this specific
+        // native child. Never replace it with data from a desktop API caller.
+        if self.editor_value(&job.operation, job.key.as_ref())? != job.value {
+            return Err(Error("settings_changed"));
+        }
+        let value = result.get("value").ok_or(Error("invalid_json"))?;
+        validate_policy_edit(&job.operation, value)?;
+        let mut settings = self.settings.clone();
+        match job.operation.as_str() {
+            "settings.global" => {
+                let proposed: GlobalRules = serde_json::from_value(value.clone())?;
+                settings.global.lifetime_seconds = proposed.lifetime_seconds;
+                settings.revoke_on_sleep = proposed.revoke_on_sleep;
+            }
+            "settings.key" => {
+                let key = job.key.as_ref().ok_or(Error("key_not_found"))?;
+                let proposed: KeyPolicyEdit = serde_json::from_value(value.clone())?;
+                settings.keys.entry(key.id.clone()).or_default().rules = (!proposed.inherits)
+                    .then_some(Rules {
+                        lifetime_seconds: proposed.lifetime_seconds,
+                    });
+            }
+            _ => return Err(Error("invalid_action")),
+        }
+        self.publish_settings(settings)
+    }
+    fn publish_settings(&mut self, settings: Settings) -> Result<()> {
+        let path = self.state_directory.join("settings.json");
+        #[cfg(not(test))]
+        let outcome = platform::save_json_outcome(&path, &settings)?;
+        #[cfg(test)]
+        let outcome = (self.save_global_settings)(&path, &settings)?;
+        // A directory-sync failure occurs after replacement: live state must
+        // match the applied file, with an explicit partial-completion result.
+        self.settings = settings;
+        match outcome {
+            platform::SaveOutcome::Durable => Ok(()),
+            platform::SaveOutcome::ReplacedButUnsynced(_) => {
+                Err(Error("settings_durability_unknown"))
+            }
+        }
     }
     fn commit_confirmation(&mut self, job: &Job, result: &Value) -> Result<()> {
         if result.get("ok") != Some(&Value::Bool(true))
@@ -107,13 +194,16 @@ impl Server {
         }
         self.require_available()?;
         match job.operation.as_str() {
+            "settings.global" | "settings.key" => return self.commit_editor(job, result),
             "rules.key" => {
                 let key = job.key.as_ref().ok_or(Error("key_not_found"))?;
                 let rules: Option<Rules> = serde_json::from_value(job.value.clone())?;
                 if let Some(rules) = &rules {
                     rules.validate()?;
                 }
-                self.settings.keys.entry(key.id.clone()).or_default().rules = rules;
+                let mut settings = self.settings.clone();
+                settings.keys.entry(key.id.clone()).or_default().rules = rules;
+                return self.publish_settings(settings);
             }
             "unbind" => {
                 let key = job.key.as_ref().ok_or(Error("key_not_found"))?;
@@ -344,6 +434,8 @@ impl Server {
         v["global_rules"] = json!(self.settings.global_rules());
         if candidates {
             v["ui_language"] = json!(crate::locale::system_ui_language());
+            v["scan_root"] = json!(self.user.home.join(".ssh"));
+            v["scan_requires_consent"] = json!(!self.settings.discovery_approved);
         }
         v["scanned"] = json!(self.settings.scanned);
         v["session_available"] = json!(self.available());
@@ -365,12 +457,19 @@ impl Server {
     ) -> Result<Value> {
         if !matches!(
             operation,
-            "scan" | "unlock" | "sync" | "encrypt" | "rules.key" | "unbind"
+            "scan"
+                | "unlock"
+                | "sync"
+                | "encrypt"
+                | "rules.key"
+                | "unbind"
+                | "settings.global"
+                | "settings.key"
         ) {
             return Err(Error("invalid_operation"));
         }
         self.require_available()?;
-        if operation != "scan" {
+        if !matches!(operation, "scan" | "settings.global") {
             let k = key.as_ref().ok_or(Error("key_not_found"))?;
             if k.unavailable.is_some() && !Self::confirmation_operation(operation) {
                 return Err(Error("key_unavailable"));
@@ -388,7 +487,14 @@ impl Server {
         if operation != "scan" && !cmd.interactive {
             return Err(Error("interaction_required"));
         }
-        let key_id = key.as_ref().map(|k| k.id.as_str()).unwrap_or("__scan");
+        let key_id =
+            key.as_ref()
+                .map(|k| k.id.as_str())
+                .unwrap_or(if operation == "settings.global" {
+                    "__settings.global"
+                } else {
+                    "__scan"
+                });
         if let Some(active) = &self.active
             && active.job.operation != operation
         {
@@ -620,13 +726,14 @@ impl Server {
         if code.is_none() {
             match active.job.operation.as_str() {
                 "scan" => {
-                    self.inventory = serde_json::from_value(result["keys"].clone())?;
-                    self.settings.scanned = true;
-                    platform::save_json(
-                        &self.state_directory.join("inventory.json"),
-                        &self.inventory,
-                    )?;
-                    self.save()?;
+                    let inventory: Vec<Key> = serde_json::from_value(result["keys"].clone())?;
+                    platform::save_json(&self.state_directory.join("inventory.json"), &inventory)?;
+                    let mut settings = self.settings.clone();
+                    settings.scanned = true;
+                    settings.discovery_approved = true;
+                    platform::save_json(&self.state_directory.join("settings.json"), &settings)?;
+                    self.inventory = inventory;
+                    self.settings = settings;
                     state = "scanned";
                 }
                 "unlock" => {
@@ -699,7 +806,11 @@ impl Server {
                 }
                 operation if Self::confirmation_operation(operation) => {
                     if let Err(error) = self.commit_confirmation(&active.job, &result) {
-                        state = "error";
+                        state = if error.0 == "settings_durability_unknown" {
+                            "partial"
+                        } else {
+                            "error"
+                        };
                         code = Some(error.0.into());
                     }
                 }
@@ -850,15 +961,21 @@ impl Server {
                     "dialog.open",
                     "mode",
                     "revoke",
-                    "rules.global",
                     "requests.status",
                     "requests.cancel"
                 ]);
-                v["dialog_actions"] = json!(["sync", "encrypt", "rules.key", "unbind"]);
+                v["dialog_actions"] = json!([
+                    "sync",
+                    "encrypt",
+                    "rules.key",
+                    "unbind",
+                    "settings.global",
+                    "settings.key"
+                ]);
                 v["interactive_required"] = json!(true);
                 v["native_confirmation_required"] = json!(true);
                 v["native_confirmation_scope"] = json!("dialog.open");
-                v["direct_actions"] = json!(["mode", "revoke", "rules.global"]);
+                v["direct_actions"] = json!(["mode", "revoke"]);
                 v["request_limits"] = json!({
                     "windows_per_minute":3, "cancel_cooldown_seconds":0, "scope":"desktop_dialogs"
                 });
@@ -867,7 +984,7 @@ impl Server {
             }
             "requests.status" | "requests.cancel" => self.request_result(&cmd, true),
             "panel.list" => self.query(true),
-            "mode" | "revoke" | "rules.global" => self.direct_action(cmd),
+            "mode" | "revoke" => self.direct_action(cmd),
             "scan" => self.request(None, "scan", &cmd, &Self::caller(peer)),
             "dialog.open" => {
                 if !cmd.interactive {
@@ -876,7 +993,12 @@ impl Server {
                 let dialog: DialogRequest = serde_json::from_value(cmd.value.clone())?;
                 if !matches!(
                     dialog.action.as_str(),
-                    "sync" | "encrypt" | "rules.key" | "unbind"
+                    "sync"
+                        | "encrypt"
+                        | "rules.key"
+                        | "unbind"
+                        | "settings.global"
+                        | "settings.key"
                 ) {
                     return Err(Error("invalid_action"));
                 }
@@ -892,47 +1014,6 @@ impl Server {
     // client; same-UID programs can perform these limited actions as well.
     fn direct_action(&mut self, cmd: Command) -> Result<Value> {
         self.require_available()?;
-        if cmd.action == "rules.global" {
-            if cmd.key.is_some() || cmd.request_id.is_some() || !cmd.value.is_object() {
-                return Err(Error("invalid_json"));
-            }
-            let mut proposed = cmd.value;
-            let revoke_on_sleep = match proposed.as_object_mut().unwrap().remove("revoke_on_sleep")
-            {
-                None => self.settings.revoke_on_sleep,
-                Some(Value::Bool(enabled)) => enabled,
-                Some(_) => return Err(Error("invalid_json")),
-            };
-            let rules: Rules = serde_json::from_value(proposed)?;
-            rules.validate()?;
-            if self.active.is_some() {
-                return Err(Error("busy"));
-            }
-            // This changes inherited policy for subsequent loads only. Do not
-            // reconcile or mutate the agent, recorded expiries or key overrides.
-            let mut settings = self.settings.clone();
-            settings.global = rules;
-            settings.revoke_on_sleep = revoke_on_sleep;
-            let path = self.state_directory.join("settings.json");
-            #[cfg(not(test))]
-            let outcome = platform::save_json_outcome(&path, &settings)?;
-            #[cfg(test)]
-            let outcome = (self.save_global_settings)(&path, &settings)?;
-            // Both successful outcomes have replaced the on-disk policy. A
-            // failed directory fsync cannot roll the rename back, so publish
-            // the new policy and report its uncertain durability explicitly.
-            self.settings = settings;
-            let (state, error) = match outcome {
-                platform::SaveOutcome::Durable => ("ready", None),
-                platform::SaveOutcome::ReplacedButUnsynced(_) => {
-                    ("partial", Some("settings_durability_unknown"))
-                }
-            };
-            let mut result = protocol::response(state, None, None, None, error);
-            result["operation"] = json!("rules.global");
-            result["global_rules"] = json!(self.settings.global_rules());
-            return Ok(result);
-        }
         let name = cmd.key.as_deref().ok_or(Error("key_not_found"))?;
         let key = keys::resolve(&self.inventory, name)?.clone();
         let loaded = match cmd.action.as_str() {
@@ -997,6 +1078,9 @@ impl Server {
     // has received consent through the inherited private channel.
     fn management_dialog(&mut self, cmd: Command, caller: &str) -> Result<Value> {
         self.require_available()?;
+        if matches!(cmd.action.as_str(), "settings.global" | "settings.key") {
+            return self.settings_dialog(cmd, caller);
+        }
         let name = cmd.key.as_deref().ok_or(Error("key_not_found"))?;
         let key = if cmd.action == "encrypt" {
             self.inventory
@@ -1316,7 +1400,11 @@ mod tests {
             state_directory: directory.path().to_path_buf(),
             sleep_marker: directory.path().join("sleep-marker"),
             sleeping: false,
-            settings: Settings::default(),
+            settings: Settings {
+                global: Rules::default(),
+                revoke_on_sleep: false,
+                ..Settings::default()
+            },
             inventory: vec![prior.clone(), pending.clone()],
             guard: Arc::new(Mutex::new(Guard {
                 sleep_marker: Some(directory.path().join("sleep-marker")),
@@ -1466,6 +1554,8 @@ mod tests {
             "encrypt",
             "rules.global",
             "rules.key",
+            "settings.global",
+            "settings.key",
             "mode",
             "unbind",
             "revoke",
@@ -1483,7 +1573,15 @@ mod tests {
                 "{action}"
             );
         }
-        for action in ["sync", "encrypt", "rules.key", "unbind", "keys.unlock"] {
+        for action in [
+            "sync",
+            "encrypt",
+            "rules.key",
+            "unbind",
+            "keys.unlock",
+            "settings.global",
+            "settings.key",
+        ] {
             let mut cmd = Command::new(action);
             cmd.interactive = true;
             cmd.key = Some(key.id.clone());
@@ -1521,14 +1619,18 @@ mod tests {
             .unwrap();
         assert_eq!(desktop["request_limits"]["cancel_cooldown_seconds"], 0);
         assert_eq!(desktop["request_limits"]["scope"], "desktop_dialogs");
-        assert_eq!(
-            desktop["direct_actions"],
-            json!(["mode", "revoke", "rules.global"])
-        );
+        assert_eq!(desktop["direct_actions"], json!(["mode", "revoke"]));
         assert_eq!(desktop["native_confirmation_scope"], "dialog.open");
         assert_eq!(
             desktop["dialog_actions"],
-            json!(["sync", "encrypt", "rules.key", "unbind"])
+            json!([
+                "sync",
+                "encrypt",
+                "rules.key",
+                "unbind",
+                "settings.global",
+                "settings.key"
+            ])
         );
         assert_eq!(
             desktop["capabilities"],
@@ -1538,7 +1640,6 @@ mod tests {
                 "dialog.open",
                 "mode",
                 "revoke",
-                "rules.global",
                 "requests.status",
                 "requests.cancel"
             ])
@@ -1630,8 +1731,16 @@ mod tests {
         let mut cmd = Command::new("unused");
         cmd.interactive = true;
         for caller in ["/usr/lib/ssh-keys/panel-client", "untrusted qs process"] {
-            for operation in ["unlock", "sync", "encrypt", "rules.key", "unbind"] {
-                let target = Some(key.clone());
+            for operation in [
+                "unlock",
+                "sync",
+                "encrypt",
+                "rules.key",
+                "unbind",
+                "settings.global",
+                "settings.key",
+            ] {
+                let target = (operation != "settings.global").then(|| key.clone());
                 assert_eq!(
                     server
                         .request(target, operation, &cmd, caller)
@@ -1934,10 +2043,132 @@ mod tests {
         cmd
     }
 
+    fn editor_command(operation: &str, key: Option<&Key>) -> Command {
+        let mut cmd = Command::new("dialog.open");
+        cmd.interactive = true;
+        cmd.key = key.map(|key| key.id.clone());
+        cmd.value = json!({"action":operation,"value":null});
+        cmd
+    }
+
+    fn pending_editor(server: &mut Server, key: &Key, operation: &str) {
+        let target = (operation == "settings.key").then_some(key);
+        let value = server.editor_value(operation, target).unwrap();
+        pending_confirmation(server, key, operation, value);
+        if target.is_none() {
+            server.active.as_mut().unwrap().job.key = None;
+            server.gate.active = Some(("__settings.global".into(), "pending-request".into()));
+        }
+    }
+
+    fn approved_policy(value: Value) -> Value {
+        json!({"ok":true,"confirmed":true,"value":value})
+    }
+
     #[test]
-    fn direct_global_rules_save_inheritance_without_access_binding_or_quota_effects() {
-        let (_directory, _agent, mut server, key, custom) = fixture();
+    fn desktop_can_only_open_policy_editors_and_cannot_submit_drafts_or_consent() {
+        let (_directory, _agent, mut server, key, _) = fixture();
         let owner = peer(&server);
+        server.save().unwrap();
+        let settings = serde_json::to_value(&server.settings).unwrap();
+        let disk = fs::read(server.state_directory.join("settings.json")).unwrap();
+        for endpoint in [false, true] {
+            let cmd = global_rules(json!({"lifetime_seconds":0,"revoke_on_sleep":false}));
+            let result = if endpoint {
+                server.desktop_command(cmd, owner)
+            } else {
+                server.command(cmd, owner)
+            };
+            assert_eq!(result.unwrap_err().0, "forbidden");
+        }
+        for operation in ["settings.global", "settings.key"] {
+            let target = (operation == "settings.key").then_some(&key);
+            let cmd = editor_command(operation, target);
+            assert_eq!(server.command(cmd, owner).unwrap_err().0, "forbidden");
+            for draft in [
+                json!({}),
+                json!({"lifetime_seconds":0,"revoke_on_sleep":false}),
+                json!({"inherits":true,"lifetime_seconds":0}),
+                json!({"confirmed":true}),
+                json!(true),
+            ] {
+                let mut cmd = editor_command(operation, target);
+                cmd.value["value"] = draft;
+                assert_eq!(
+                    server.desktop_command(cmd, owner).unwrap_err().0,
+                    "invalid_json"
+                );
+            }
+            for extra in ["confirmed", "consent", "ok", "request_id"] {
+                let mut cmd = editor_command(operation, target);
+                cmd.value[extra] = json!(true);
+                assert_eq!(
+                    server.desktop_command(cmd, owner).unwrap_err().0,
+                    "invalid_json"
+                );
+            }
+            let mut cmd = editor_command(operation, target);
+            cmd.request_id = Some("another-request".into());
+            assert_eq!(
+                server.desktop_command(cmd, owner).unwrap_err().0,
+                "invalid_json"
+            );
+            let mut cmd = editor_command(operation, target);
+            cmd.interactive = false;
+            assert_eq!(
+                server.desktop_command(cmd, owner).unwrap_err().0,
+                "interaction_required"
+            );
+            for (available, locked) in [(false, false), (true, true)] {
+                server.session.available = available;
+                server.session.locked = locked;
+                assert_eq!(
+                    server
+                        .desktop_command(editor_command(operation, target), owner)
+                        .unwrap_err()
+                        .0,
+                    "session_locked_or_unavailable"
+                );
+            }
+            server.session.available = true;
+            server.session.locked = false;
+            let stranger = libc::ucred {
+                uid: owner.uid.wrapping_add(1),
+                ..owner
+            };
+            assert_eq!(
+                server
+                    .desktop_command(editor_command(operation, target), stranger)
+                    .unwrap_err()
+                    .0,
+                "wrong_user"
+            );
+        }
+        assert_eq!(
+            server
+                .desktop_command(editor_command("settings.global", Some(&key)), owner)
+                .unwrap_err()
+                .0,
+            "invalid_json"
+        );
+        assert_eq!(
+            server
+                .desktop_command(editor_command("settings.key", None), owner)
+                .unwrap_err()
+                .0,
+            "key_not_found"
+        );
+        assert_eq!(serde_json::to_value(&server.settings).unwrap(), settings);
+        assert_eq!(
+            fs::read(server.state_directory.join("settings.json")).unwrap(),
+            disk
+        );
+        assert!(server.active.is_none() && server.history.is_empty());
+    }
+
+    #[test]
+    fn approved_global_editor_preserves_key_overrides_bindings_and_current_access() {
+        let (_directory, _agent, mut server, key, custom) = fixture();
         server.settings.scanned = true;
         server.settings.global.lifetime_seconds = 60;
         server
@@ -1959,38 +2190,32 @@ mod tests {
         server.save().unwrap();
         let per_key = serde_json::to_value(&server.settings.keys).unwrap();
         let expiry = server.expiry.clone();
-        let generation = server.guard.lock().unwrap().generation;
-        let external_epoch = server.external_epoch;
-        for now in 0..3 {
-            server.gate.check("old-window", now).unwrap();
-            server.gate.check_dialog("old-dialog", now).unwrap();
-        }
-        // Repeating the same setting, unlimited access and both lifetime
-        // boundaries affect only the inherited policy for subsequent loads.
-        for desired in [900, 900, 0, 31_536_000] {
-            let response = server
-                .desktop_command(global_rules(json!({"lifetime_seconds":desired})), owner)
-                .unwrap();
-            assert_eq!(
-                response,
-                json!({
-                    "api_version":protocol::API, "state":"ready", "operation":"rules.global",
-                    "key_id":null, "request_id":null, "expires_at":null, "error_code":null,
-                    "global_rules":{"lifetime_seconds":desired,"revoke_on_sleep":false}
-                })
+        for (lifetime, sleep) in [(900, true), (0, false), (31_536_000, true)] {
+            let snapshot = json!(server.settings.global_rules());
+            pending_editor(&mut server, &key, "settings.global");
+            assert_eq!(server.active.as_ref().unwrap().job.value, snapshot);
+            assert!(server.active.as_ref().unwrap().job.key.is_none());
+            finish_confirmation(
+                &mut server,
+                approved_policy(json!({"lifetime_seconds":lifetime,"revoke_on_sleep":sleep})),
             );
+            assert_eq!(server.history["pending-request"]["state"], "completed");
             let saved: Settings = serde_json::from_slice(
                 &fs::read(server.state_directory.join("settings.json")).unwrap(),
             )
             .unwrap();
-            assert_eq!(saved.global.lifetime_seconds, desired);
+            assert_eq!(saved.global.lifetime_seconds, lifetime);
+            assert_eq!(saved.revoke_on_sleep, sleep);
             assert!(saved.scanned && server.settings.scanned);
             assert_eq!(serde_json::to_value(&saved.keys).unwrap(), per_key);
             assert_eq!(
                 serde_json::to_value(&server.settings.keys).unwrap(),
                 per_key
             );
-            assert_eq!(server.settings.effective(&key.id).lifetime_seconds, desired);
+            assert_eq!(
+                server.settings.effective(&key.id).lifetime_seconds,
+                lifetime
+            );
             assert_eq!(server.settings.effective(&custom.id).lifetime_seconds, 45);
             assert_eq!(server.expiry, expiry);
             let loaded = agent::list(&server.backend()).unwrap();
@@ -2000,146 +2225,133 @@ mod tests {
                 fs::read(&credential).unwrap(),
                 b"disposable ciphertext fixture"
             );
-            assert_eq!(server.guard.lock().unwrap().generation, generation);
-            assert_eq!(server.external_epoch, external_epoch);
             assert!(server.active.is_none() && server.gate.active.is_none());
-            assert!(server.history.is_empty());
         }
-        assert_eq!(
-            server.gate.check("old-window", 3).unwrap_err().0,
-            "rate_limited"
-        );
-        assert_eq!(
-            server.gate.check_dialog("old-dialog", 3).unwrap_err().0,
-            "rate_limited"
-        );
     }
 
     #[test]
-    fn direct_global_rules_validate_owner_session_strict_object_and_no_target() {
+    fn approved_key_editor_controls_override_and_inheritance_without_reloading() {
         let (_directory, _agent, mut server, key, _) = fixture();
-        let owner = peer(&server);
-        server.save().unwrap();
-        let settings = serde_json::to_value(&server.settings).unwrap();
-        let disk = fs::read(server.state_directory.join("settings.json")).unwrap();
+        server.settings.global.lifetime_seconds = 60;
         let expiry = server.expiry.clone();
-        let stranger = libc::ucred {
-            uid: owner.uid.wrapping_add(1),
-            ..owner
-        };
-        let value = json!({"lifetime_seconds":900});
-        assert_eq!(
-            server
-                .desktop_command(global_rules(value.clone()), stranger)
-                .unwrap_err()
-                .0,
-            "wrong_user"
-        );
-        assert_eq!(
-            server
-                .command(global_rules(value.clone()), owner)
-                .unwrap_err()
-                .0,
-            "forbidden"
-        );
-        for (available, locked) in [(false, false), (true, true)] {
-            server.session.available = available;
-            server.session.locked = locked;
+        for (inherits, lifetime) in [(false, 900), (false, 0), (true, 900)] {
+            pending_editor(&mut server, &key, "settings.key");
+            let value = &server.active.as_ref().unwrap().job.value;
+            assert_eq!(value["global_lifetime_seconds"], 60);
             assert_eq!(
-                server
-                    .desktop_command(global_rules(value.clone()), owner)
-                    .unwrap_err()
-                    .0,
-                "session_locked_or_unavailable"
+                value["lifetime_seconds"],
+                server.settings.effective(&key.id).lifetime_seconds
             );
-        }
-        server.session.available = true;
-        server.session.locked = false;
-        for invalid in [
-            Value::Null,
-            json!({}),
-            json!(true),
-            json!([]),
-            json!([900]),
-            json!({"lifetime_seconds":-1}),
-            json!({"lifetime_seconds":1.5}),
-            json!({"lifetime_seconds":"900"}),
-            json!({"lifetime_seconds":null}),
-            json!({"lifetime_seconds":900,"confirmed":true}),
-            json!({"lifetime_seconds":900,"revoke_on_lock":false}),
-        ] {
+            finish_confirmation(
+                &mut server,
+                approved_policy(json!({"inherits":inherits,"lifetime_seconds":lifetime})),
+            );
+            assert_eq!(server.history["pending-request"]["state"], "completed");
+            assert_eq!(server.settings.keys[&key.id].rules.is_none(), inherits);
             assert_eq!(
-                server
-                    .desktop_command(global_rules(invalid), owner)
-                    .unwrap_err()
-                    .0,
-                "invalid_json"
+                server.settings.effective(&key.id).lifetime_seconds,
+                if inherits { 60 } else { lifetime }
             );
+            assert_eq!(server.expiry, expiry);
+            assert_eq!(agent::list(&server.backend()).unwrap().len(), 1);
         }
-        assert_eq!(
-            server
-                .desktop_command(global_rules(json!({"lifetime_seconds":31_536_001})), owner)
-                .unwrap_err()
-                .0,
-            "invalid_lifetime"
-        );
-        for (target, request) in [
-            (Some(key.id.clone()), None),
-            (None, Some("pending-request".into())),
-        ] {
-            let mut cmd = global_rules(value.clone());
-            cmd.key = target;
-            cmd.request_id = request;
-            assert_eq!(
-                server.desktop_command(cmd, owner).unwrap_err().0,
-                "invalid_json"
-            );
-        }
-        assert_eq!(
-            server
-                .desktop_command(dialog("rules.global", &key, value.clone()), owner)
-                .unwrap_err()
-                .0,
-            "invalid_action"
-        );
-        assert_eq!(
-            server
-                .request(
-                    None,
-                    "rules.global",
-                    &global_rules(value),
-                    "untrusted caller"
-                )
-                .unwrap_err()
-                .0,
-            "invalid_operation"
-        );
-        assert_eq!(serde_json::to_value(&server.settings).unwrap(), settings);
-        assert_eq!(
-            fs::read(server.state_directory.join("settings.json")).unwrap(),
-            disk
-        );
-        assert_eq!(server.expiry, expiry);
-        assert_eq!(agent::list(&server.backend()).unwrap().len(), 1);
-        assert!(server.active.is_none() && server.history.is_empty());
     }
 
     #[test]
-    fn direct_global_rules_busy_keeps_pending_job_and_its_captured_lifetime() {
+    fn policy_editors_reject_stale_snapshot_malformed_value_and_missing_consent() {
+        let (_directory, _agent, mut server, key, _) = fixture();
+        for operation in ["settings.global", "settings.key"] {
+            let valid = if operation == "settings.global" {
+                json!({"lifetime_seconds":0,"revoke_on_sleep":false})
+            } else {
+                json!({"inherits":true,"lifetime_seconds":0})
+            };
+            pending_editor(&mut server, &key, operation);
+            // Even a key inheriting the global duration cannot approve a
+            // different duration than the authoritative one it displayed.
+            server.settings.global.lifetime_seconds = 120;
+            finish_confirmation(&mut server, approved_policy(valid.clone()));
+            assert_eq!(
+                server.history["pending-request"]["error_code"],
+                "settings_changed"
+            );
+            assert_eq!(server.settings.global.lifetime_seconds, 120);
+            server.settings.global.lifetime_seconds = 60;
+            let before = serde_json::to_value(&server.settings).unwrap();
+            for result in [
+                json!({"ok":true,"value":valid}),
+                json!({"ok":true,"confirmed":false,"value":valid}),
+                approved_policy(Value::Null),
+                approved_policy(json!({})),
+                approved_policy(json!({"inherits":true,"lifetime_seconds":31_536_001})),
+                approved_policy(
+                    json!({"lifetime_seconds":0,"revoke_on_sleep":false,"confirmed":true}),
+                ),
+            ] {
+                pending_editor(&mut server, &key, operation);
+                finish_confirmation(&mut server, result);
+                assert_eq!(server.history["pending-request"]["state"], "error");
+                assert_eq!(serde_json::to_value(&server.settings).unwrap(), before);
+            }
+        }
+    }
+
+    #[test]
+    fn pending_policy_editor_cancellation_expiry_sleep_and_lock_never_commit() {
+        let (_directory, _agent, mut server, key, _) = fixture();
+        for operation in ["settings.global", "settings.key"] {
+            for cause in ["cancel", "expire", "sleep", "lock"] {
+                pending_editor(&mut server, &key, operation);
+                let before = serde_json::to_value(&server.settings).unwrap();
+                match cause {
+                    "cancel" => server
+                        .cancel_active("cancelled", Some("cancelled"), true)
+                        .unwrap(),
+                    "expire" => {
+                        server.active.as_mut().unwrap().deadline = Instant::now();
+                        server.tick().unwrap();
+                    }
+                    "sleep" => {
+                        server.prepare_sleep().unwrap();
+                        server.sleeping = false;
+                    }
+                    "lock" => {
+                        server
+                            .update_session(Session {
+                                available: true,
+                                locked: true,
+                                ..Default::default()
+                            })
+                            .unwrap();
+                        server
+                            .update_session(Session {
+                                available: true,
+                                ..Default::default()
+                            })
+                            .unwrap();
+                    }
+                    _ => unreachable!(),
+                }
+                server.tick().unwrap();
+                assert!(server.active.is_none() && server.gate.active.is_none());
+                assert_eq!(serde_json::to_value(&server.settings).unwrap(), before);
+                assert_ne!(server.history["pending-request"]["state"], "completed");
+            }
+        }
+    }
+
+    #[test]
+    fn policy_editor_busy_never_changes_active_request_or_captured_lifetime() {
         let (_directory, _agent, mut server, key, pending) = fixture();
         let owner = peer(&server);
-        server.save().unwrap();
-        let disk = fs::read(server.state_directory.join("settings.json")).unwrap();
-        let settings = serde_json::to_value(&server.settings).unwrap();
-        let expiry = server.expiry.clone();
         let pid = pending_request(&mut server, pending, false);
         let deadline = server.active.as_ref().unwrap().deadline;
         let rules = server.active.as_ref().unwrap().job.rules.clone();
-        for operation in ["unlock", "sync", "rules.key", "scan"] {
-            server.active.as_mut().unwrap().job.operation = operation.into();
+        for operation in ["settings.global", "settings.key"] {
+            let target = (operation == "settings.key").then_some(&key);
             assert_eq!(
                 server
-                    .desktop_command(global_rules(json!({"lifetime_seconds":900})), owner)
+                    .desktop_command(editor_command(operation, target), owner)
                     .unwrap_err()
                     .0,
                 "busy"
@@ -2148,217 +2360,128 @@ mod tests {
             assert_eq!(active.child.id(), pid);
             assert_eq!(active.deadline, deadline);
             assert_eq!(active.job.rules, rules);
-            assert_eq!(active.job.operation, operation);
-            assert_eq!(server.guard.lock().unwrap().generation, 0);
-            assert_eq!(unsafe { libc::kill(pid as i32, 0) }, 0);
-            assert_eq!(server.history["pending-request"]["state"], "pending");
-            assert_eq!(serde_json::to_value(&server.settings).unwrap(), settings);
-            assert_eq!(
-                fs::read(server.state_directory.join("settings.json")).unwrap(),
-                disk
-            );
-            assert_eq!(server.expiry, expiry);
         }
-        server.active.as_mut().unwrap().job.operation = "unlock".into();
         server
             .cancel_active("cancelled", Some("cancelled"), true)
             .unwrap();
-        let loaded = agent::list(&server.backend()).unwrap();
-        assert_eq!(loaded.len(), 1);
-        assert!(loaded.contains_key(&key.id));
     }
 
     #[test]
-    fn failed_global_rules_write_does_not_publish_policy_or_mutate_access() {
-        let (directory, _agent, mut server, key, _) = fixture();
+    fn public_unlock_api_cannot_poll_or_cancel_native_policy_editor() {
+        let (_directory, _agent, mut server, key, _) = fixture();
         let owner = peer(&server);
-        server.settings.global.lifetime_seconds = 60;
-        server
-            .settings
-            .keys
-            .entry(key.id.clone())
-            .or_default()
-            .fingerprint_mode = true;
-        let credential = server.credential_path(&key.id);
-        fs::write(&credential, b"disposable ciphertext fixture").unwrap();
+        for operation in ["settings.global", "settings.key"] {
+            pending_editor(&mut server, &key, operation);
+            let public = server.command(Command::new("keys.list"), owner).unwrap();
+            assert!(public["active_request"].is_null() && public["active_operation"].is_null());
+            for action in ["requests.status", "requests.cancel"] {
+                let mut cmd = Command::new(action);
+                cmd.request_id = Some("pending-request".into());
+                assert_eq!(
+                    server.command(cmd, owner).unwrap_err().0,
+                    "request_not_found"
+                );
+                assert_eq!(server.active.as_ref().unwrap().job.operation, operation);
+            }
+            server
+                .cancel_active("cancelled", Some("cancelled"), true)
+                .unwrap();
+        }
+    }
+
+    #[test]
+    fn failed_policy_save_leaves_memory_disk_and_access_unchanged() {
+        let (directory, _agent, mut server, key, _) = fixture();
         server.save().unwrap();
         let settings = serde_json::to_value(&server.settings).unwrap();
         let disk = fs::read(server.state_directory.join("settings.json")).unwrap();
         let expiry = server.expiry.clone();
         let blocker = directory.path().join("not-a-directory");
         fs::write(&blocker, b"disposable write failure fixture").unwrap();
-        let original_directory = server.state_directory.clone();
-        // Fail before the atomic replacement, leaving the saved settings
-        // available for a byte-for-byte comparison after the rejected save.
-        server.state_directory = blocker;
-        let result = server.desktop_command(
-            global_rules(json!({"lifetime_seconds":900,"revoke_on_sleep":true})),
-            owner,
-        );
-        server.state_directory = original_directory;
-        assert!(result.is_err());
-        assert_eq!(serde_json::to_value(&server.settings).unwrap(), settings);
-        assert_eq!(
-            fs::read(server.state_directory.join("settings.json")).unwrap(),
-            disk
-        );
-        assert_eq!(server.expiry, expiry);
-        let loaded = agent::list(&server.backend()).unwrap();
-        assert_eq!(loaded.len(), 1);
-        assert!(loaded.contains_key(&key.id));
-        assert_eq!(
-            fs::read(&credential).unwrap(),
-            b"disposable ciphertext fixture"
-        );
-        assert!(server.active.is_none() && server.history.is_empty());
+        for operation in ["settings.global", "settings.key"] {
+            pending_editor(&mut server, &key, operation);
+            let original = std::mem::replace(&mut server.state_directory, blocker.clone());
+            let value = if operation == "settings.global" {
+                json!({"lifetime_seconds":900,"revoke_on_sleep":true})
+            } else {
+                json!({"inherits":false,"lifetime_seconds":900})
+            };
+            finish_confirmation(&mut server, approved_policy(value));
+            server.state_directory = original;
+            assert_eq!(server.history["pending-request"]["state"], "error");
+            assert_eq!(serde_json::to_value(&server.settings).unwrap(), settings);
+            assert_eq!(
+                fs::read(server.state_directory.join("settings.json")).unwrap(),
+                disk
+            );
+            assert_eq!(server.expiry, expiry);
+            assert_eq!(agent::list(&server.backend()).unwrap().len(), 1);
+        }
     }
 
     #[test]
-    fn global_rules_parent_sync_failure_reports_committed_policy_without_extending_access() {
-        let (_directory, _agent, mut server, key, custom) = fixture();
-        let owner = peer(&server);
-        server.settings.global.lifetime_seconds = 60;
-        server
-            .settings
-            .keys
-            .entry(key.id.clone())
-            .or_default()
-            .fingerprint_mode = true;
-        server
-            .settings
-            .keys
-            .entry(custom.id.clone())
-            .or_default()
-            .rules = Some(Rules {
-            lifetime_seconds: 45,
-        });
-        let credential = server.credential_path(&key.id);
-        fs::write(&credential, b"disposable ciphertext fixture").unwrap();
-        server.save().unwrap();
-        let per_key = serde_json::to_value(&server.settings.keys).unwrap();
+    fn policy_parent_sync_failure_reports_partial_and_preserves_applied_policy() {
+        let (_directory, _agent, mut server, key, _) = fixture();
         let expiry = server.expiry.clone();
-        let generation = server.guard.lock().unwrap().generation;
         server.save_global_settings = |path, settings| {
             platform::save_json_outcome_with_parent_sync(path, settings, |parent| {
-                // Inject only the final directory-sync failure: the same
-                // atomic writer must already have replaced the real file.
                 let replaced: Settings =
                     serde_json::from_slice(&fs::read(parent.join("settings.json")).unwrap())
                         .unwrap();
                 assert_eq!(
-                    serde_json::to_value(&replaced).unwrap(),
+                    serde_json::to_value(replaced).unwrap(),
                     serde_json::to_value(settings).unwrap()
                 );
-                assert_eq!(replaced.global.lifetime_seconds, 900);
                 Err(Error("disposable_parent_sync_failure"))
             })
         };
-        let response = server
-            .desktop_command(
-                global_rules(json!({"lifetime_seconds":900,"revoke_on_sleep":true})),
-                owner,
-            )
-            .unwrap();
-        assert_eq!(
-            response,
-            json!({
-                "api_version":protocol::API, "state":"partial", "operation":"rules.global",
-                "key_id":null, "request_id":null, "expires_at":null,
-                "error_code":"settings_durability_unknown",
-                "global_rules":{"lifetime_seconds":900,"revoke_on_sleep":true}
-            })
+        pending_editor(&mut server, &key, "settings.global");
+        finish_confirmation(
+            &mut server,
+            approved_policy(json!({"lifetime_seconds":900,"revoke_on_sleep":true})),
         );
-        let saved: Settings = serde_json::from_slice(
-            &fs::read(server.state_directory.join("settings.json")).unwrap(),
-        )
-        .unwrap();
-        assert_eq!(saved.global, server.settings.global);
-        assert!(saved.revoke_on_sleep && server.settings.revoke_on_sleep);
-        assert_eq!(server.settings.effective(&key.id).lifetime_seconds, 900);
-        assert_eq!(server.settings.effective(&custom.id).lifetime_seconds, 45);
-        assert_eq!(serde_json::to_value(&saved.keys).unwrap(), per_key);
+        assert_eq!(server.history["pending-request"]["state"], "partial");
         assert_eq!(
-            serde_json::to_value(&server.settings.keys).unwrap(),
-            per_key
+            server.history["pending-request"]["error_code"],
+            "settings_durability_unknown"
         );
+        assert_eq!(server.settings.global.lifetime_seconds, 900);
+        assert!(server.settings.revoke_on_sleep);
         assert_eq!(server.expiry, expiry);
-        let loaded = agent::list(&server.backend()).unwrap();
-        assert_eq!(loaded.len(), 1);
-        assert!(loaded.contains_key(&key.id));
-        assert_eq!(
-            fs::read(&credential).unwrap(),
-            b"disposable ciphertext fixture"
-        );
-        assert_eq!(server.guard.lock().unwrap().generation, generation);
-        assert!(server.active.is_none() && server.history.is_empty());
+        assert_eq!(agent::list(&server.backend()).unwrap().len(), 1);
     }
 
     #[test]
-    fn global_sleep_preference_is_atomic_independent_and_legacy_timer_updates_preserve_it() {
-        let (_directory, _agent, mut server, key, custom) = fixture();
+    fn first_discovery_scope_is_desktop_only_and_scanned_changes_on_success() {
+        let (_directory, _agent, mut server, key, _) = fixture();
         let owner = peer(&server);
-        let expiry = server.expiry.clone();
-        server
-            .settings
-            .keys
-            .entry(custom.id.clone())
-            .or_default()
-            .rules = Some(Rules {
-            lifetime_seconds: 45,
-        });
-        for enabled in [true, false, true] {
-            let response = server
-                .desktop_command(
-                    global_rules(json!({
-                        "lifetime_seconds":900,"revoke_on_sleep":enabled,
-                    })),
-                    owner,
-                )
-                .unwrap();
-            assert_eq!(
-                response["global_rules"],
-                json!({"lifetime_seconds":900,"revoke_on_sleep":enabled})
-            );
-            // Older panels can still change a duration without resetting sleep
-            // policy. Missing and explicit null are deliberately different.
-            let response = server
-                .desktop_command(global_rules(json!({"lifetime_seconds":120})), owner)
-                .unwrap();
-            assert_eq!(
-                response["global_rules"],
-                json!({"lifetime_seconds":120,"revoke_on_sleep":enabled})
-            );
-            let saved: Settings = serde_json::from_slice(
-                &fs::read(server.state_directory.join("settings.json")).unwrap(),
-            )
+        let panel = server
+            .desktop_command(Command::new("panel.list"), owner)
             .unwrap();
-            assert_eq!(saved.revoke_on_sleep, enabled);
-            assert_eq!(saved.global.lifetime_seconds, 120);
-            assert_eq!(server.settings.effective(&custom.id).lifetime_seconds, 45);
-            let capabilities = server.command(Command::new("capabilities"), owner).unwrap();
-            assert_eq!(capabilities["revocation"]["on_sleep"], enabled);
-            assert_eq!(capabilities["revocation"]["sleep_supported"], true);
-            assert_eq!(capabilities["revocation"]["on_lock"], false);
-            assert_eq!(server.expiry, expiry);
-            let loaded = agent::list(&server.backend()).unwrap();
-            assert_eq!(loaded.len(), 1);
-            assert!(loaded.contains_key(&key.id));
-        }
-        let before = serde_json::to_value(&server.settings).unwrap();
-        for invalid in [Value::Null, json!(1), json!("true"), json!([]), json!({})] {
-            assert_eq!(
-                server
-                    .desktop_command(
-                        global_rules(json!({"lifetime_seconds":120,"revoke_on_sleep":invalid})),
-                        owner
-                    )
-                    .unwrap_err()
-                    .0,
-                "invalid_json"
-            );
-        }
-        assert_eq!(serde_json::to_value(&server.settings).unwrap(), before);
-        assert!(server.active.is_none() && server.history.is_empty());
+        assert_eq!(panel["scan_root"], json!(server.user.home.join(".ssh")));
+        assert_eq!(panel["scanned"], false);
+        assert_eq!(panel["scan_requires_consent"], true);
+        assert!(
+            server
+                .command(Command::new("keys.list"), owner)
+                .unwrap()
+                .get("scan_root")
+                .is_none()
+        );
+        pending_confirmation(&mut server, &key, "scan", Value::Null);
+        finish_confirmation(&mut server, json!({"error_code":"cancelled"}));
+        assert!(!server.settings.scanned && !server.settings.discovery_approved);
+        pending_confirmation(&mut server, &key, "scan", Value::Null);
+        let inventory = json!(server.inventory);
+        finish_confirmation(&mut server, json!({"keys":inventory}));
+        assert!(server.settings.scanned && server.settings.discovery_approved);
+        assert_eq!(server.history["pending-request"]["state"], "scanned");
+        // Invalidating the cached inventory later does not repeat the first-use intro.
+        server.settings.scanned = false;
+        let panel = server
+            .desktop_command(Command::new("panel.list"), owner)
+            .unwrap();
+        assert_eq!(panel["scan_requires_consent"], false);
     }
 
     fn sleep_command(action: &str) -> SleepCommand {
@@ -2558,7 +2681,7 @@ mod tests {
             Command::new("scan"),
             direct("revoke", &loaded, Value::Null),
             direct("mode", &loaded, json!({"fingerprint_mode":true})),
-            global_rules(json!({"lifetime_seconds":900,"revoke_on_sleep":false})),
+            editor_command("settings.global", None),
             dialog("sync", &loaded, Value::Null),
             dialog("encrypt", &loaded, Value::Null),
             dialog("unbind", &loaded, Value::Null),
@@ -2624,10 +2747,7 @@ mod tests {
             let owner = peer(&server);
             assert_eq!(
                 server
-                    .desktop_command(
-                        global_rules(json!({"lifetime_seconds":0,"revoke_on_sleep":false})),
-                        owner
-                    )
+                    .desktop_command(editor_command("settings.global", None), owner)
                     .unwrap_err()
                     .0,
                 "sleep_in_progress"

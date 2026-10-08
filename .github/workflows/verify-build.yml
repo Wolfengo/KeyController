@@ -1,0 +1,91 @@
+name: Verify distribution build
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - name: Pin source and builder inputs
+        id: inputs
+        shell: bash
+        run: |
+          set -euo pipefail
+          echo "epoch=$(git log -1 --format=%ct)" >> "$GITHUB_OUTPUT"
+          git archive --format=tar HEAD > "$RUNNER_TEMP/keycontroller-source.tar"
+          docker pull archlinux:base-devel
+          base_image=$(docker image inspect --format '{{index .RepoDigests 0}}' archlinux:base-devel)
+          printf '%s\n' "$base_image" > "$RUNNER_TEMP/keycontroller-base-image.txt"
+          docker build --build-arg "BASE_IMAGE=$base_image" -t keycontroller-builder -f .github/ci/Dockerfile .github/ci
+          docker image inspect --format '{{.Id}}' keycontroller-builder > "$RUNNER_TEMP/keycontroller-builder-image.txt"
+      - name: Build and test twice in separate clean containers
+        env:
+          SOURCE_DATE_EPOCH: ${{ steps.inputs.outputs.epoch }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          for attempt in first second; do
+            output="$RUNNER_TEMP/keycontroller-$attempt"
+            mkdir "$output"
+            chmod 777 "$output"
+            cp "$RUNNER_TEMP/keycontroller-base-image.txt" "$output/BASE_IMAGE"
+            cp "$RUNNER_TEMP/keycontroller-builder-image.txt" "$output/BUILDER_IMAGE"
+            docker run --rm --cap-drop=ALL --security-opt=no-new-privileges \
+              --env SOURCE_DATE_EPOCH --env "SOURCE_COMMIT=$GITHUB_SHA" \
+              --mount "type=bind,src=$RUNNER_TEMP/keycontroller-source.tar,dst=/source.tar,readonly" \
+              --mount "type=bind,src=$PWD/.github/ci/build-package,dst=/build-package,readonly" \
+              --mount "type=bind,src=$output,dst=/output" \
+              keycontroller-builder /bin/bash /build-package
+          done
+          diff -qr "$RUNNER_TEMP/keycontroller-first" "$RUNNER_TEMP/keycontroller-second"
+      - name: Keep verified distribution candidates
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: distribution-${{ github.sha }}
+          path: ${{ runner.temp }}/keycontroller-first/
+          if-no-files-found: error
+          retention-days: 14
+
+  provenance:
+    needs: build
+    # Only an explicit maintainer dispatch on a version tag may attest files.
+    # Pull-request builds never receive signing/OIDC permissions.
+    if: github.event_name == 'workflow_dispatch' && github.ref_type == 'tag' && startsWith(github.ref_name, 'v') && github.repository == 'Wolfengo/KeyController'
+    runs-on: ubuntu-24.04
+    environment: release-attestation
+    permissions:
+      contents: read
+      actions: read
+      id-token: write
+      attestations: write
+    steps:
+      - uses: actions/download-artifact@634f93cb2916e3fdff6788551b99b062d0335ce0 # v5
+        with:
+          name: distribution-${{ github.sha }}
+          path: dist
+      - name: Attest candidate archives and manifest
+        uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4
+        with:
+          subject-path: |
+            dist/*.tar.gz
+            dist/*.pkg.tar.zst
+            dist/SHA256SUMS
+            dist/PKGBUILD
+            dist/keycontroller.install
+            dist/SRCINFO
+            dist/SOURCE_COMMIT
+            dist/SOURCE_DATE_EPOCH
+            dist/BASE_IMAGE
+            dist/BUILDER_IMAGE
+          create-storage-record: false

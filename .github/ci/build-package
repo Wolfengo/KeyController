@@ -1,0 +1,26 @@
+#!/bin/bash
+# Runs as the non-root builder inside a disposable container.
+set -euo pipefail
+[[ $(id -u) != 0 ]]
+[[ ${SOURCE_DATE_EPOCH:?} =~ ^[0-9]+$ ]]
+[[ ${SOURCE_COMMIT:?} =~ ^[0-9a-f]{40}$ ]]
+mkdir source
+tar -xf /source.tar -C source
+cd source
+python tests/reproducible-export.py
+python scripts/package-source
+cd dist
+makepkg --cleanbuild --noconfirm
+# Compilation and check() run without sudo; no package is installed here.
+cp -- *.tar.gz *.pkg.tar.zst PKGBUILD keycontroller.install /output/
+cp -- .SRCINFO /output/SRCINFO
+printf '%s\n' "$SOURCE_COMMIT" > /output/SOURCE_COMMIT
+printf '%s\n' "$SOURCE_DATE_EPOCH" > /output/SOURCE_DATE_EPOCH
+python - <<'PY'
+import hashlib
+from pathlib import Path
+output = Path('/output')
+files = sorted(path for path in output.iterdir() if path.name != 'SHA256SUMS')
+(output / 'SHA256SUMS').write_text(''.join(
+    hashlib.sha256(path.read_bytes()).hexdigest() + '  ' + path.name + '\n' for path in files))
+PY

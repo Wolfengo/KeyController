@@ -17,7 +17,7 @@ Unlock with a passphrase or fingerprint, choose how long a key stays available, 
 
 Use the key's passphrase, or **link it to your enrolled fingerprint**. Each key remembers its preferred method. Switch between them directly in the widget; switching alone never opens the key.
 
-Unlocking opens a compact authentication window. Fingerprint scanning starts automatically, and progress stays visible while the key opens. The window shows who requested access and, when provided, why. **Lock** closes access immediately, without another confirmation window.
+Unlocking opens a compact authentication window. Fingerprint scanning starts automatically, and progress stays visible while the key opens. The window shows the key fingerprint, access duration, the requesting transport program and, when provided, its reason. **Lock** closes access immediately, without another confirmation window.
 
 <table>
   <tr>
@@ -34,9 +34,9 @@ Linking checks your key's passphrase and fingerprint, then leaves the key locked
 
 ## Decide how long access lasts
 
-Set a shared duration, give individual keys their own timer, or leave access unlimited. Timers continue working when the widget is closed. New durations apply on the next unlock.
+Start with **one minute of access**, set a shared duration, or give individual keys their own timer. Unlimited access remains available. Use the gear beside a key or in the header to edit its rules in the compact native window; **Save** approves the change. Timers continue working when the widget is closed. New durations apply on the next unlock.
 
-Enable **Revoke before sleep** to close all managed key access before the computer sleeps. After waking, those keys stay locked until you open them again. This option starts off; screen locking alone does not revoke keys.
+**Revoke before sleep** closes all managed key access before the computer sleeps. After waking, those keys stay locked until you open them again. It starts enabled on new installations; existing saved settings are preserved. Screen locking alone does not revoke keys.
 
 <table>
   <tr>
@@ -45,13 +45,13 @@ Enable **Revoke before sleep** to close all managed key access before the comput
   </tr>
   <tr>
     <td align="center" valign="top"><img src="docs/screenshots/global-settings.png" alt="Global access duration presets, custom duration and optional revocation before sleep" width="350"></td>
-    <td align="center" valign="top"><img src="docs/screenshots/key-settings.png" alt="An individual key with a one-hour duration, inheritance control and fingerprint unlink action" width="350"></td>
+    <td align="center" valign="top"><img src="docs/screenshots/key-settings.png" alt="Native settings window for a demonstration key with a custom access duration and inheritance control" width="350"></td>
   </tr>
 </table>
 
 ## Keep the keys you already use
 
-KeyController finds existing keys in `~/.ssh`, including subfolders. It supports **Ed25519, RSA and ECDSA in OpenSSH format**. The first scan is automatic; refresh whenever you add or move a key.
+KeyController finds existing keys in `~/.ssh`, including subfolders. It supports **Ed25519, RSA and ECDSA in OpenSSH format**. Before the first scan, the widget asks to search this folder and its subfolders. Refresh whenever you add or move a key.
 
 The **+** button lets you add a passphrase to an unencrypted key. Its public identity stays the same, so your servers' `authorized_keys` need no changes. Existing encrypted keys can be added without changing their passphrase.
 
@@ -64,7 +64,7 @@ The **+** button lets you add a passphrase to an unencrypted key. Its public ide
 
 ## Let your tools ask for access
 
-**AI agents, applications and your own scripts** can request a key through **`kctrl`**. You see who requested access and why in the same authentication window; the calling tool receives the result without receiving your passphrase. A key that is already open is reused without extending its timer.
+**AI agents, applications and your own scripts** can request a key through **`kctrl`**. The same authentication window shows the requesting transport program (such as `kctrl`) and its supplied reason; the calling tool receives the result without receiving your passphrase. A key that is already open is reused without extending its timer.
 
 For example, add an unlock request to a deployment script before its SSH step:
 
@@ -107,7 +107,7 @@ Install the widget with Omarchy's plugin manager:
 omarchy plugin add https://github.com/Wolfengo/KeyController.git --enable
 ```
 
-Requires Omarchy with Quickshell, OpenSSH and the separate **KeyController system package**. The widget checks dependencies and guides setup. Until the helper is available in your signed package repositories, it needs a [separate package installation](docs/setup.md#installation). Fingerprint use additionally requires TPM2, fprintd and an enrolled fingerprint; passphrase mode works without biometric hardware. [Full requirements and setup](docs/setup.md#installation)
+Requires Omarchy with Quickshell, OpenSSH and the separate **KeyController system package**. Choose **Install and set up** in the widget to install missing packages and connect the agent through one guided flow. The wizard uses signed system repositories; while the helper awaits [repository inclusion](https://github.com/omacom/omarchy-pkgs/pull/857), it shows package availability and a status link. Fingerprint use additionally requires TPM2, fprintd and an enrolled fingerprint; passphrase mode works without biometric hardware. [Full requirements and setup](docs/setup.md#installation)
 
 To remove the widget:
 
