@@ -78,6 +78,19 @@ Instructions for **Codex, Claude Code and OpenCode** are included and connected 
 
 ## Fits your desktop
 
+<table>
+  <tr>
+    <th>Tokyo Night</th>
+    <th>Gruvbox</th>
+    <th>Flexoki Light</th>
+  </tr>
+  <tr>
+    <td><a href="docs/screenshots/theme-tokyo-night.png"><img src="docs/screenshots/theme-tokyo-night.png" alt="KeyController main screen in the Omarchy Tokyo Night theme" width="220"></a></td>
+    <td><a href="docs/screenshots/theme-gruvbox.png"><img src="docs/screenshots/theme-gruvbox.png" alt="KeyController main screen in the Omarchy Gruvbox theme" width="220"></a></td>
+    <td><a href="docs/screenshots/theme-flexoki-light.png"><img src="docs/screenshots/theme-flexoki-light.png" alt="KeyController main screen in the Omarchy Flexoki Light theme" width="220"></a></td>
+  </tr>
+</table>
+
 - **Theme-aware:** icons, colors and fonts follow Omarchy.
 - **English and Russian:** selected automatically from the system language.
 - **Standard SSH tools:** works through the original OpenSSH agent for SSH and Git.
