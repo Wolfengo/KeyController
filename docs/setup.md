@@ -46,11 +46,11 @@ Run setup as the desktop user in an unlocked local session. It connects the mana
 
 The public agent socket is `/run/ssh-keys/UID/agent.sock`, and the helper service is `ssh-keysd@UID.service`. These private identifiers are retained for installation compatibility. Setup preserves an existing KeyController checkout and its bar position. Update a Git-installed widget with `omarchy plugin update org.omarchy.keycontroller`; update the privileged helper separately through its package. If no widget exists, setup creates a link to `/usr/share/keycontroller/plugin`, which then receives widget updates through the package manager. Restart the shell with `omarchy restart shell` after QML updates, while the screen is unlocked.
 
-Widget version `0.3.0` and system package version `0.1.1-1` are maintained separately; API v1 is their compatibility boundary. Setup records completion only after all configuration steps and the Hyprland reload succeed. If setup was interrupted, use **Set up KeyController** again or rerun `keycontroller-setup --apply`; an enabled service alone does not count as completed setup.
+Widget version `0.4.0` and system package version `0.1.3-1` are maintained separately; API v1 is their compatibility boundary. Setup records completion only after all configuration steps and the Hyprland reload succeed. If setup was interrupted, use **Set up KeyController** again or rerun `keycontroller-setup --apply`; an enabled service alone does not count as completed setup.
 
 For Omarchy plugin distribution, the repository's root `manifest.json` points to `plugin/Panel.qml`. The source packaging script also produces a standalone widget archive under `dist/`. The widget checks runtime dependencies and shows **Install and set up** with the missing requirements when needed. If packages are already present, **Set up KeyController** starts the same wizard at the configuration step. Key controls stay unavailable until setup has completed and the wizard has released its installation lock.
 
-Required runtime packages are `keycontroller>=0.1.1-1`, `openssh>=10.5p1`, `qt6-base`, `qt6-svg`, `qt6-wayland`, `layer-shell-qt>=6.6`, `systemd`, `pam`, `python` and `polkit`. Linux 6.5 or newer, an active local Hyprland/logind session and Yama `kernel.yama.ptrace_scope` of 1, 2 or 3 are required. Fingerprint use additionally requires `fprintd`, a system-enrolled fingerprint and TPM2. Passphrase unlocking remains available without biometric hardware.
+Required runtime packages are `keycontroller>=0.1.3-1`, `openssh>=10.5p1`, `qt6-base`, `qt6-svg`, `qt6-wayland`, `layer-shell-qt>=6.6`, `systemd`, `pam`, `python` and `polkit`. Linux 6.5 or newer, an active local Hyprland/logind session and Yama `kernel.yama.ptrace_scope` of 1, 2 or 3 are required. Fingerprint use additionally requires `fprintd`, a system-enrolled fingerprint and TPM2. Passphrase unlocking remains available without biometric hardware.
 
 ## First use and access rules
 
@@ -66,10 +66,9 @@ The header gear opens general settings in the protected native window. A key's g
 kctrl capabilities --json
 kctrl keys list --json
 kctrl keys unlock --key '<key-id>' --interactive --reason 'Continue the authorized SSH operation' --json
-kctrl requests status '<request-id>' --json
 ```
 
-Use the returned request ID to wait for completion; `pending` is not successful access. An already loaded key returns immediately without extending its lifetime. Scripts cannot submit passphrases, bind keys, encrypt files or change policy through the public API.
+Unlock waits for the result of one request and returns exit 0 only on success. Give the calling process about 130 seconds, and stop a script on any nonzero result. An already loaded key returns immediately without extending its lifetime. Add `--no-wait` for the asynchronous interface, then follow its request ID with `kctrl requests status`; `pending` is not successful access. Scripts cannot submit passphrases, bind keys, encrypt files or change policy through the public API.
 
 The package includes a [skill](../skills/keycontroller/SKILL.md), CLI help and [API reference](api.md). Setup links the skill for detected Codex, Claude Code, OpenCode and existing `.agents` clients without editing project `AGENTS.md` files or client permissions. To install only these links, run:
 

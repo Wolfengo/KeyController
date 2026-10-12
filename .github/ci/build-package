@@ -16,6 +16,8 @@ cp -- *.tar.gz *.pkg.tar.zst PKGBUILD keycontroller.install /output/
 cp -- .SRCINFO /output/SRCINFO
 printf '%s\n' "$SOURCE_COMMIT" > /output/SOURCE_COMMIT
 printf '%s\n' "$SOURCE_DATE_EPOCH" > /output/SOURCE_DATE_EPOCH
+cp /etc/pacman.d/mirrorlist /output/BUILD_REPOSITORIES
+LC_ALL=C pacman -Q | LC_ALL=C sort > /output/BUILD_PACKAGES
 python - <<'PY'
 import hashlib
 from pathlib import Path

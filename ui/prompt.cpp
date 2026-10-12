@@ -829,6 +829,9 @@ private:
 
 #ifndef SSH_KEYS_UI_TEST
 int main(int argc, char **argv) {
+  // Dependency probing must exercise this exact executable's dynamic linker
+  // without opening a display, an IPC channel, or any secret input surface.
+  if (argc == 2 && qstrcmp(argv[1], "--check-runtime") == 0) return 0;
   rlimit core{0, 0};
   if (setrlimit(RLIMIT_CORE, &core) || prctl(PR_SET_DUMPABLE, 0) || prctl(PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0)) return 1;
   ucred peer{};

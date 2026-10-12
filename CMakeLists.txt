@@ -35,5 +35,11 @@ if(BUILD_TESTING)
   set_tests_properties(prompt-accessibility PROPERTIES TIMEOUT 45)
   add_test(NAME prompt-accessibility-preflight COMMAND "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/tests/prompt-accessibility-preflight.py")
   add_test(NAME prompt-consent COMMAND prompt-test)
+  add_test(NAME prompt-runtime COMMAND ssh-keys-prompt --check-runtime)
   set_tests_properties(prompt-consent PROPERTIES ENVIRONMENT "QT_QPA_PLATFORM=offscreen;QT_QPA_PLATFORMTHEME=;QT_STYLE_OVERRIDE=Fusion")
 endif()
+
+# The Arch package must carry the minimum runtime for this particular binary.
+# A Qt 6 SONAME alone does not make a newer-minor build load on an older Qt 6.
+file(WRITE "${CMAKE_CURRENT_BINARY_DIR}/qt-runtime-versions"
+  "${Qt6Core_VERSION} ${Qt6Svg_VERSION}\n")

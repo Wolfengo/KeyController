@@ -222,6 +222,7 @@ ColumnLayout {
     Layout.fillWidth: true
     visible: text !== ""
     text: root.errorCode === "terminal_unavailable" ? root.t("Не удалось открыть терминал")
+      : root.errorCode === "prompt_runtime_unavailable" ? root.t("Защищённое окно несовместимо с установленными библиотеками. Нужна сборка KeyController для вашей версии системы.")
       : root.errorCode === "unsupported_repositories" ? root.t("Автоматическая установка доступна со штатными репозиториями Omarchy/Arch. Обнаружены другие репозитории; их настройки не изменены.")
       : root.errorCode === "repository_signatures_disabled" ? root.t("Все подключённые репозитории должны требовать доверенную подпись пакетов.")
       : root.helperUnavailable ? root.t("Системный пакет keycontroller пока недоступен в подключённых репозиториях. После его появления нажмите «Проверить снова».")

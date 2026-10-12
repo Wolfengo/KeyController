@@ -45,21 +45,60 @@ executing that helper.
 
 `.github/workflows/verify-build.yml` builds the same source twice in separate
 containers as a non-root user. The official Arch base image is resolved to a
-content digest once, packages are installed into a builder image once, and that
-same resulting image is used for both builds. The source commit, epoch, base-image
-digest and builder-image ID accompany the artifacts. Actions are pinned by full
+content digest once. Its entire package set is then synchronized to Omarchy's
+official stable Arch mirror (`https://stable-mirror.omarchy.org/$repo/os/$arch`),
+including downgrades when the current Arch image is newer. This is a full
+environment synchronization, never a selective Qt downgrade. Build dependencies
+come from the same mirror; the same resulting builder image is used for both
+builds. The source commit, epoch, base-image digest, builder-image ID, repository
+URL (`BUILD_REPOSITORIES`) and complete installed package inventory
+(`BUILD_PACKAGES`) accompany the artifacts. Actions are pinned by full
 commit SHA. The package builds run without sudo, capabilities, host-home mounts,
 or credentials; the workflow never installs the package on the host.
 
 Every source archive, recipe and binary package must compare byte-for-byte before
 artifacts are retained. If they differ, the workflow fails rather than silently
 normalizing or ignoring package metadata. The image digest and `.BUILDINFO` help
-diagnose dependency/toolchain differences. Arch repositories move over time: a
+diagnose dependency/toolchain differences. Omarchy's stable mirror moves over time: a
 later workflow run may use different toolchain packages. Matching two isolated
 builds in one run is useful evidence, not an independent third-party rebuild or
 a promise of identical outputs across arbitrary dependency versions. A clean
 hardware/system installation, native aarch64 build and fingerprint/TPM/sleep
 validation remain separate acceptance checks.
+
+## Runtime compatibility of binary packages
+
+Build distributable Omarchy packages in an environment using the target Omarchy
+repository set. A successful build on current Arch does not establish that its
+binary will run on an Omarchy release whose libraries are older. In particular,
+[Qt's binary compatibility promise](https://doc.qt.io/qt-6/qt-releases.html#binary-compatibility)
+allows older Qt applications to run with newer Qt of the same major version;
+the reverse is not guaranteed. A shared `libQt6Core.so.6` name does not establish
+minor-version compatibility.
+
+CMake records the Qt Core and Svg versions selected for the prompt in the build
+directory. During packaging, the recipe records those full versions as minimum
+`qt6-base` and `qt6-svg` runtime dependencies, and requires `qt6-wayland` at least
+as new as the selected Core version. For example, a Qt 6.12.0 build must not be
+installed on Qt 6.11.2. Rebuilding the same source against Qt 6.11.2 produces a
+package with that lower runtime requirement. The binary package's `.PKGINFO`
+contains these build-specific bounds; the source recipe and `.SRCINFO` list the
+dependencies needed to select a build environment before compilation.
+
+`tests/package-qt-dependencies.py` builds small metadata-only package fixtures
+through the real recipe's dependency function and inspects their `.PKGINFO`.
+This prevents accepting a newer-Qt binary merely because unversioned Qt packages
+are installed. Never bypass Pacman's dependency checks to install an incompatible
+binary, or update individual Qt packages independently of the supported system
+update. For release acceptance, inspect the final package metadata and run its
+prompt on the supported target repository snapshot. The verification workflow
+uses the same stable Arch mirror selected by the official
+[Omarchy package builder](https://github.com/omacom/omarchy-pkgs/blob/master/build/Dockerfile)
+with `MIRROR=stable`; all current build dependencies are in its core/extra
+repositories. It does not install unrelated Omarchy packages or enable unsigned
+package downloads. Historical Arch-latest CI artifacts remain build evidence
+with their original runtime requirements; they are not retroactively compatible
+with older Omarchy systems.
 
 ## Provenance and publication
 

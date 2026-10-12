@@ -26,7 +26,6 @@ struct Active {
     child: Child,
     output: File,
     deadline: Instant,
-    epoch: u64,
 }
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -71,8 +70,6 @@ pub struct Server {
     history: BTreeMap<String, Value>,
     history_order: VecDeque<String>,
     agent_reset_failed: bool,
-    expiry: BTreeMap<String, Option<u64>>,
-    external_epoch: u64,
     gate_clock: Instant,
     #[cfg(test)]
     reset_backend: fn(&Server) -> Result<()>,
@@ -233,7 +230,11 @@ impl Server {
         if self.sleep_preparing() {
             return Err(Error("sleep_in_progress"));
         }
-        if !self.session.available || self.session.locked || self.agent_reset_failed {
+        if !self.session.available
+            || self.session.locked
+            || self.agent_reset_failed
+            || self.guard.lock().unwrap().reset_required
+        {
             return Err(Error("session_locked_or_unavailable"));
         }
         Ok(())
@@ -301,7 +302,9 @@ impl Server {
         Ok(value)
     }
     fn refresh_guard(&self) {
-        self.guard.lock().unwrap().blocked = !self.available();
+        let blocked = !self.available();
+        let mut guard = self.guard.lock().unwrap();
+        guard.blocked = blocked || guard.reset_required;
     }
     fn update_session(&mut self, session: Session) -> Result<()> {
         self.session = session;
@@ -335,11 +338,12 @@ impl Server {
             let was = guard.blocked;
             guard.blocked = true;
             guard.generation = guard.generation.wrapping_add(1);
-            guard.external_epoch = guard.external_epoch.wrapping_add(1);
+            guard.reset_required = true;
             guard.managed_added_at = None;
+            guard.managed_key = None;
+            guard.lifetimes.clear();
             was
         };
-        self.expiry.clear();
         #[cfg(not(test))]
         let reset = platform::agent_unit(&self.user, "stop")
             .and_then(|()| platform::agent_unit(&self.user, "start"));
@@ -353,27 +357,51 @@ impl Server {
             self.agent_reset_failed = true;
             return Err(Error("agent_reset_failed"));
         }
-        self.guard.lock().unwrap().blocked = was_blocked;
+        let mut guard = self.guard.lock().unwrap();
+        guard.reset_required = false;
+        guard.agent_locked = false;
+        guard.blocked = was_blocked;
+        Ok(())
+    }
+    fn maintain_agent(&mut self) -> Result<()> {
+        if self.agent_reset_failed {
+            return Err(Error("agent_reset_failed"));
+        }
+        let cleanup = {
+            let mut guard = self.guard.lock().unwrap();
+            agent::reap_deadlines(&self.backend(), &mut guard)
+        };
+        if cleanup.is_err() {
+            // The proxy has already fenced every request. Kill/reap any
+            // loader before resetting, so it cannot repopulate the backend.
+            self.cancel_active("cancelled", Some("agent_unavailable"), false)?;
+            if self.guard.lock().unwrap().reset_required {
+                self.reset_agent()?;
+            }
+            self.refresh_guard();
+        }
         Ok(())
     }
     fn reconcile(&mut self) -> Result<BTreeMap<String, Vec<u8>>> {
-        let epoch = self.guard.lock().unwrap().external_epoch;
-        if epoch != self.external_epoch {
-            self.expiry.clear();
-            self.external_epoch = epoch;
-        }
+        self.maintain_agent()?;
+        let mut guard = self.guard.lock().unwrap();
         let loaded = agent::list(&self.backend()).map_err(|_| Error("agent_unavailable"))?;
-        self.expiry.retain(|id, _| loaded.contains_key(id));
+        if !guard.agent_locked {
+            guard.lifetimes.retain(|id, _| loaded.contains_key(id));
+        }
         Ok(loaded)
     }
     fn status(&self, k: &Key, loaded: &BTreeMap<String, Vec<u8>>, desktop: bool) -> Value {
         let live = loaded.contains_key(&k.id);
-        let known = self.expiry.get(&k.id);
+        let known = self.guard.lock().unwrap().lifetimes.get(&k.id).cloned();
         let mut v = protocol::response(
             if live { "unlocked" } else { "locked" },
             Some(&k.id),
             None,
-            known.copied().flatten(),
+            known
+                .as_ref()
+                .filter(|_| live)
+                .and_then(|lifetime| lifetime.expires_at),
             None,
         );
         let o = v.as_object_mut().unwrap();
@@ -556,9 +584,13 @@ impl Server {
         // group. Drop its old numeric tombstone if the kernel reused that PID.
         g.retired_worker_groups.remove(&(child.id() as i32));
         g.worker_group = Some(child.id() as i32);
+        g.managed_key = if operation == "unlock" {
+            Some((key_id.into(), job.rules.lifetime_seconds))
+        } else {
+            None
+        };
         g.managed_added_at = None;
         g.managed_add_uncertain = false;
-        let epoch = g.external_epoch;
         drop(g);
         self.gate.active = Some((key_id.into(), request_id.clone()));
         let mut v = protocol::response(
@@ -575,7 +607,6 @@ impl Server {
             child,
             output,
             deadline: Instant::now() + Duration::from_secs(protocol::REQUEST_SECONDS),
-            epoch,
         });
         Ok(v)
     }
@@ -583,13 +614,17 @@ impl Server {
         let mut guard = self.guard.lock().unwrap();
         let was = guard.blocked;
         guard.blocked = true;
-        let result = agent::list(&self.backend()).and_then(|list| {
-            if list.contains_key(&key.id) {
-                agent::remove_key(&self.backend(), key)
-            } else {
-                Ok(())
-            }
-        });
+        let result = if guard.agent_locked || guard.reset_required {
+            Err(Error("agent_reset_required"))
+        } else {
+            agent::list(&self.backend()).and_then(|list| {
+                if list.contains_key(&key.id) {
+                    agent::remove_key(&self.backend(), key)
+                } else {
+                    Ok(())
+                }
+            })
+        };
         if result.is_err() {
             drop(guard);
             if self
@@ -606,7 +641,7 @@ impl Server {
             }
             guard = self.guard.lock().unwrap();
         }
-        self.expiry.remove(&key.id);
+        guard.lifetimes.remove(&key.id);
         guard.blocked = was;
         Ok(())
     }
@@ -619,7 +654,7 @@ impl Server {
         code: Option<&str>,
         preserve_loaded: bool,
     ) -> Result<()> {
-        if let Some(mut active) = self.active.take() {
+        let cleanup = if let Some(mut active) = self.active.take() {
             let (uncertain, added) = {
                 // Serialize with any ADD already in progress and fence both
                 // old connections and unaccepted sockets from this worker.
@@ -640,32 +675,52 @@ impl Server {
                 libc::kill(-(active.child.id() as i32), libc::SIGKILL);
             }
             let _ = active.child.wait();
-            self.guard.lock().unwrap().worker_group = None;
+            {
+                let mut guard = self.guard.lock().unwrap();
+                guard.worker_group = None;
+                guard.managed_key = None;
+            }
             let key = active.job.key.as_ref();
             let key_id = Self::operation_key(&active.job);
-            if active.job.operation == "unlock" {
-                if !preserve_loaded || uncertain {
+            let cleanup = match active.job.operation.as_str() {
+                "unlock" if !preserve_loaded || uncertain => {
                     // A failed/unknown ADD may commit after its connection
                     // failed. The failure path remains fail-closed.
-                    self.reset_agent()?;
-                } else if added && let Some(k) = key {
+                    self.reset_agent()
+                }
+                "unlock" if added => {
                     // Session cancellation removes only this unfinished load.
-                    self.revoke(k)?;
+                    key.map_or(Ok(()), |key| self.revoke(key))
                 }
-            }
-            let mut actual_state = state;
-            let mut actual_code = code;
-            if active.job.operation == "encrypt" {
-                if let Some(k) = key {
-                    self.revoke(k)?;
+                "encrypt" => {
+                    // Cancellation may race the atomic rename. Invalidate the
+                    // inventory even if revocation fails; do not run a file
+                    // helper synchronously inside the session event loop.
+                    self.settings.scanned = false;
+                    let revoke = key.map_or(Ok(()), |key| self.revoke(key));
+                    let save = self.save();
+                    // Attempt both cleanups, prioritizing a failed agent reset
+                    // (which keeps the proxy closed and terminates the service).
+                    revoke.and(save)
                 }
-                // Cancellation may race the atomic rename. Do not run a file
-                // helper synchronously inside the session event loop.
-                self.settings.scanned = false;
-                self.save()?;
-                actual_state = "partial";
-                actual_code = Some("commit_state_unknown");
-            }
+                _ => Ok(()),
+            };
+            let (actual_state, actual_code) = match cleanup.as_ref() {
+                Err(error) => (
+                    if active.job.operation == "encrypt" {
+                        "partial"
+                    } else {
+                        "error"
+                    },
+                    Some(error.0),
+                ),
+                Ok(()) if active.job.operation == "encrypt" => {
+                    ("partial", Some("commit_state_unknown"))
+                }
+                Ok(()) => (state, code),
+            };
+            // Taking active transfers responsibility for finishing the request.
+            // Cleanup errors must not leave a pending history entry or busy gate.
             self.gate.finish(
                 key_id,
                 active.job.operation == "unlock",
@@ -680,11 +735,15 @@ impl Server {
             );
             value["operation"] = json!(active.job.operation);
             self.remember(active.job.request_id.clone(), value);
-        }
+            cleanup
+        } else {
+            Ok(())
+        };
         self.refresh_guard();
-        Ok(())
+        cleanup
     }
     fn tick(&mut self) -> Result<()> {
+        self.maintain_agent()?;
         let Some(active) = self.active.as_mut() else {
             return Ok(());
         };
@@ -703,11 +762,11 @@ impl Server {
         active.output.take(4 * 1024 * 1024).read_to_end(&mut out)?;
         let result: Value =
             serde_json::from_slice(&out).unwrap_or(json!({"error_code":"worker_failed"}));
-        let (epoch, added_at) = {
+        {
             let mut g = self.guard.lock().unwrap();
             g.worker_group = None;
-            (g.external_epoch, g.managed_added_at)
-        };
+            g.managed_key = None;
+        }
         let key = active.job.key.as_ref();
         let id = key.map(|k| k.id.as_str());
         let mut code = result
@@ -755,19 +814,6 @@ impl Server {
                             state = "error";
                             code = Some("agent_unavailable".into());
                         } else {
-                            if epoch == active.epoch {
-                                self.expiry.insert(
-                                    k.id.clone(),
-                                    if active.job.rules.lifetime_seconds == 0 {
-                                        None
-                                    } else {
-                                        Some(
-                                            added_at.unwrap_or(platform::now())
-                                                + active.job.rules.lifetime_seconds as u64,
-                                        )
-                                    },
-                                );
-                            }
                             state = "unlocked";
                             self.settings
                                 .keys
@@ -853,7 +899,14 @@ impl Server {
             active.job.operation == "unlock" && matches!(state, "cancelled" | "denied"),
             self.gate_clock.elapsed().as_secs(),
         );
-        let expiry = id.and_then(|k| self.expiry.get(k).copied().flatten());
+        let expiry = id.and_then(|k| {
+            self.guard
+                .lock()
+                .unwrap()
+                .lifetimes
+                .get(k)
+                .and_then(|lifetime| lifetime.expires_at)
+        });
         let mut value = protocol::response(
             state,
             id,
@@ -1248,8 +1301,6 @@ pub fn serve(uid: u32) -> Result<()> {
         history: BTreeMap::new(),
         history_order: VecDeque::new(),
         agent_reset_failed: false,
-        expiry: BTreeMap::new(),
-        external_epoch: 0,
         gate_clock: Instant::now(),
         #[cfg(test)]
         reset_backend: |_| Err(Error("test_backend_not_configured")),
@@ -1321,6 +1372,7 @@ pub fn serve(uid: u32) -> Result<()> {
                 Event::Session(session) => server.update_session(session)?,
             }
         }
+        server.maintain_agent()?;
         if let Ok((cmd, peer, desktop, reply)) = commands.try_recv() {
             let result = if desktop {
                 server.desktop_command(cmd, peer)
@@ -1394,7 +1446,7 @@ mod tests {
         };
         let prior = make_key("prior");
         let pending = make_key("pending");
-        let mut server = Server {
+        let server = Server {
             user: User::get(unsafe { libc::getuid() }).unwrap(),
             backend_path: backend,
             state_directory: directory.path().to_path_buf(),
@@ -1419,8 +1471,6 @@ mod tests {
             history: BTreeMap::new(),
             history_order: VecDeque::new(),
             agent_reset_failed: false,
-            expiry: BTreeMap::new(),
-            external_epoch: 0,
             gate_clock: Instant::now(),
             save_global_settings: platform::save_json_outcome,
             reset_backend: |server| {
@@ -1440,9 +1490,115 @@ mod tests {
         };
         add(&server, &prior);
         server
-            .expiry
-            .insert(prior.id.clone(), Some(platform::now() + 60));
+            .guard
+            .lock()
+            .unwrap()
+            .lifetimes
+            .insert(prior.id.clone(), agent::Lifetime::new(60).unwrap());
         (directory, agent, server, prior, pending)
+    }
+
+    fn recorded_expiry(server: &Server) -> BTreeMap<String, Option<u64>> {
+        server
+            .guard
+            .lock()
+            .unwrap()
+            .lifetimes
+            .iter()
+            .map(|(id, lifetime)| (id.clone(), lifetime.expires_at))
+            .collect()
+    }
+
+    fn lock_fixture_agent(server: &Server, lock: bool) {
+        let secret = b"disposable locked agent fixture";
+        let mut packet = vec![if lock { 22 } else { 23 }];
+        packet.extend_from_slice(&(secret.len() as u32).to_be_bytes());
+        packet.extend_from_slice(secret);
+        assert_eq!(
+            agent::exchange(&server.backend(), &packet)
+                .unwrap()
+                .as_slice(),
+            [6]
+        );
+        server.guard.lock().unwrap().agent_locked = lock;
+    }
+
+    #[test]
+    fn agent_lock_hides_keys_without_erasing_managed_deadlines() {
+        let (_directory, _agent, mut server, key, _) = fixture();
+        let original = recorded_expiry(&server);
+        lock_fixture_agent(&server, true);
+        let hidden = server.reconcile().unwrap();
+        assert!(hidden.is_empty());
+        let locked_status = server.status(&key, &hidden, true);
+        assert_eq!(locked_status["state"], "locked");
+        assert_eq!(locked_status["lifetime_known"], false);
+        assert!(locked_status["expires_at"].is_null());
+        assert_eq!(recorded_expiry(&server), original);
+        lock_fixture_agent(&server, false);
+        let loaded = server.reconcile().unwrap();
+        let status = server.status(&key, &loaded, true);
+        assert_eq!(status["state"], "unlocked");
+        assert_eq!(status["lifetime_known"], true);
+        assert_eq!(status["expires_at"], json!(original[&key.id]));
+    }
+
+    #[test]
+    fn expired_hidden_key_fences_loader_and_resets_or_exits_fail_closed() {
+        for fail_reset in [false, true] {
+            let (_directory, _agent, mut server, key, pending) = fixture();
+            pending_confirmation(&mut server, &pending, "sync", Value::Null);
+            let pid = server.active.as_ref().unwrap().child.id();
+            lock_fixture_agent(&server, true);
+            server
+                .guard
+                .lock()
+                .unwrap()
+                .lifetimes
+                .get_mut(&key.id)
+                .unwrap()
+                .deadline = Some(
+                agent::boot_now()
+                    .unwrap()
+                    .saturating_sub(Duration::from_secs(1)),
+            );
+            // Model the proxy detecting expiry while the helper is occupied.
+            {
+                let mut guard = server.guard.lock().unwrap();
+                assert!(agent::reap_deadlines(&server.backend(), &mut guard).is_err());
+            }
+            server.refresh_guard();
+            assert!(!server.available());
+            assert!(server.guard.lock().unwrap().blocked);
+            server.reset_backend = if fail_reset {
+                |_| Err(Error("disposable_reset_failure"))
+            } else {
+                |server| {
+                    assert!(server.active.is_none());
+                    assert!(server.guard.lock().unwrap().reset_required);
+                    lock_fixture_agent(server, false);
+                    assert_eq!(agent::exchange(&server.backend(), &[19])?.as_slice(), [6]);
+                    Ok(())
+                }
+            };
+            if fail_reset {
+                assert_eq!(server.tick().unwrap_err().0, "agent_reset_failed");
+                server.refresh_guard();
+                assert!(server.agent_reset_failed && !server.available());
+            } else {
+                server.tick().unwrap();
+                assert!(server.available());
+                assert!(agent::list(&server.backend()).unwrap().is_empty());
+            }
+            assert!(server.active.is_none() && server.gate.active.is_none());
+            assert_eq!(server.history["pending-request"]["state"], "cancelled");
+            let guard = server.guard.lock().unwrap();
+            assert_eq!(guard.reset_required, fail_reset);
+            assert_eq!(guard.blocked, fail_reset);
+            assert!(guard.worker_group.is_none() && guard.managed_key.is_none());
+            assert!(guard.retired_worker_groups.contains(&(pid as i32)));
+            assert_eq!(unsafe { libc::kill(pid as i32, 0) }, -1);
+        }
     }
 
     fn add(server: &Server, key: &Key) {
@@ -1493,7 +1649,6 @@ mod tests {
             child,
             output: process::memfile(b"{}", false).unwrap(),
             deadline: Instant::now() + Duration::from_secs(30),
-            epoch: 0,
         });
         let mut value = protocol::response(
             "pending",
@@ -1830,7 +1985,7 @@ mod tests {
     fn loaded_access_does_not_create_a_window_or_extend_lifetime() {
         let (_directory, _agent, mut server, key, _) = fixture();
         let peer = peer(&server);
-        let expiry = server.expiry[&key.id];
+        let expiry = recorded_expiry(&server)[&key.id];
         for now in 0..3 {
             server.gate.check("previous", now).unwrap();
         }
@@ -1842,7 +1997,7 @@ mod tests {
         assert_eq!(response["state"], "unlocked");
         assert_eq!(response["expires_at"], json!(expiry));
         assert!(response["request_id"].is_null());
-        assert_eq!(server.expiry[&key.id], expiry);
+        assert_eq!(recorded_expiry(&server)[&key.id], expiry);
         assert!(server.active.is_none());
     }
 
@@ -1885,7 +2040,7 @@ mod tests {
     #[test]
     fn only_strict_worker_confirmation_commits_captured_policy() {
         let (_directory, _agent, mut server, key, _) = fixture();
-        let expiry = server.expiry[&key.id];
+        let expiry = recorded_expiry(&server)[&key.id];
         server.settings.global.lifetime_seconds = 900;
         for response in [
             json!({}),
@@ -1926,7 +2081,7 @@ mod tests {
         );
         assert_eq!(server.settings.effective(&key.id).lifetime_seconds, 900);
         assert!(server.settings.keys[&key.id].rules.is_some());
-        assert_eq!(server.expiry[&key.id], expiry);
+        assert_eq!(recorded_expiry(&server)[&key.id], expiry);
         assert_eq!(agent::list(&server.backend()).unwrap().len(), 1);
         let persisted: Settings = serde_json::from_slice(
             &fs::read(server.state_directory.join("settings.json")).unwrap(),
@@ -1953,7 +2108,7 @@ mod tests {
         finish_confirmation(&mut server, json!({"ok":true,"confirmed":true}));
         assert!(server.settings.keys[&key.id].rules.is_none());
         assert_eq!(server.settings.effective(&key.id).lifetime_seconds, 900);
-        assert_eq!(server.expiry[&key.id], expiry);
+        assert_eq!(recorded_expiry(&server)[&key.id], expiry);
     }
 
     #[test]
@@ -1970,7 +2125,7 @@ mod tests {
         server.save().unwrap();
         let settings_file = server.state_directory.join("settings.json");
         let before = fs::read(&settings_file).unwrap();
-        let expiry = server.expiry[&key.id];
+        let expiry = recorded_expiry(&server)[&key.id];
         for expire in [false, true] {
             for (operation, value) in [
                 ("rules.key", json!({"lifetime_seconds":45})),
@@ -1989,11 +2144,129 @@ mod tests {
                 assert_eq!(fs::read(&settings_file).unwrap(), before);
                 assert_eq!(serde_json::to_vec(&server.settings).unwrap(), before);
                 assert!(credential.is_file());
-                assert_eq!(server.expiry[&key.id], expiry);
+                assert_eq!(recorded_expiry(&server)[&key.id], expiry);
                 assert_eq!(agent::list(&server.backend()).unwrap().len(), 1);
             }
         }
         assert_eq!(server.gate.check(&key.id, 0).unwrap(), None);
+    }
+
+    #[test]
+    fn cancel_active_encrypt_timeout_records_partial_and_releases_gate() {
+        let (_directory, _agent, mut server, key, other) = fixture();
+        server.settings.scanned = true;
+        server.save().unwrap();
+        pending_confirmation(&mut server, &key, "encrypt", Value::Null);
+        let active = server.active.as_mut().unwrap();
+        let pid = active.child.id();
+        active.deadline = Instant::now();
+
+        server.tick().unwrap();
+
+        assert!(server.active.is_none() && server.gate.active.is_none());
+        let guard = server.guard.lock().unwrap();
+        assert!(!guard.blocked && guard.worker_group.is_none());
+        assert!(guard.retired_worker_groups.contains(&(pid as i32)));
+        drop(guard);
+        assert_eq!(unsafe { libc::kill(pid as i32, 0) }, -1);
+        assert_eq!(
+            std::io::Error::last_os_error().raw_os_error(),
+            Some(libc::ESRCH)
+        );
+        let response = &server.history["pending-request"];
+        assert_eq!(response["state"], "partial");
+        assert_eq!(response["error_code"], "commit_state_unknown");
+        assert_eq!(response["operation"], "encrypt");
+        assert!(!server.settings.scanned);
+        let persisted: Settings = serde_json::from_slice(
+            &fs::read(server.state_directory.join("settings.json")).unwrap(),
+        )
+        .unwrap();
+        assert!(!persisted.scanned);
+        assert!(agent::list(&server.backend()).unwrap().is_empty());
+        assert!(!recorded_expiry(&server).contains_key(&key.id));
+        // A management timeout must neither coalesce into the dead request nor
+        // apply an unlock cooldown or keep another key busy.
+        assert_eq!(server.gate.check(&key.id, 0).unwrap(), None);
+        assert_eq!(server.gate.check(&other.id, 0).unwrap(), None);
+    }
+
+    #[test]
+    fn cancel_active_encrypt_cleanup_failures_are_terminal_and_release_gate() {
+        for (fail_revoke, fail_save) in [(false, true), (true, false), (true, true)] {
+            let (directory, _agent, mut server, key, other) = fixture();
+            server.settings.scanned = true;
+            server.save().unwrap();
+            pending_confirmation(&mut server, &key, "encrypt", Value::Null);
+            let active = server.active.as_mut().unwrap();
+            let pid = active.child.id();
+            if fail_revoke {
+                // Keep the matching identity loaded in the disposable agent,
+                // but fail selective removal and its whole-agent fallback.
+                active.job.key.as_mut().unwrap().public_blob = "invalid base64".into();
+                server.reset_backend = |_| Err(Error("disposable_reset_failure"));
+            }
+            if fail_save {
+                let blocker = directory.path().join("not-a-directory");
+                fs::write(&blocker, b"disposable write failure fixture").unwrap();
+                server.state_directory = blocker;
+            }
+            let owner = peer(&server);
+            let expected_error = if fail_revoke {
+                "agent_reset_failed"
+            } else {
+                "io_error"
+            };
+            let mut cancel = Command::new("requests.cancel");
+            cancel.request_id = Some("pending-request".into());
+            assert_eq!(
+                server.desktop_command(cancel, owner).unwrap_err().0,
+                expected_error
+            );
+
+            assert!(server.active.is_none() && server.gate.active.is_none());
+            assert_eq!(server.agent_reset_failed, fail_revoke);
+            let guard = server.guard.lock().unwrap();
+            assert_eq!(guard.blocked, fail_revoke);
+            assert!(guard.worker_group.is_none());
+            assert!(guard.retired_worker_groups.contains(&(pid as i32)));
+            drop(guard);
+            assert_eq!(unsafe { libc::kill(pid as i32, 0) }, -1);
+            assert_eq!(
+                std::io::Error::last_os_error().raw_os_error(),
+                Some(libc::ESRCH)
+            );
+            assert!(!server.settings.scanned);
+            if !fail_save {
+                let persisted: Settings = serde_json::from_slice(
+                    &fs::read(server.state_directory.join("settings.json")).unwrap(),
+                )
+                .unwrap();
+                // Revocation failure must not skip inventory invalidation.
+                assert!(!persisted.scanned);
+            }
+            if fail_revoke {
+                assert!(!server.available());
+            } else {
+                assert!(server.available());
+                assert!(agent::list(&server.backend()).unwrap().is_empty());
+                assert!(!recorded_expiry(&server).contains_key(&key.id));
+            }
+            assert_eq!(server.gate.check(&key.id, 0).unwrap(), None);
+            assert_eq!(server.gate.check(&other.id, 0).unwrap(), None);
+            if fail_revoke {
+                assert_eq!(server.tick().unwrap_err().0, "agent_reset_failed");
+            } else {
+                server.tick().unwrap();
+            }
+            let mut status = Command::new("requests.status");
+            status.request_id = Some("pending-request".into());
+            let response = server.desktop_command(status, owner).unwrap();
+            assert_eq!(response["state"], "partial");
+            assert_eq!(response["error_code"], expected_error);
+            assert_eq!(response["request_id"], "pending-request");
+            assert_eq!(response["operation"], "encrypt");
+        }
     }
 
     #[test]
@@ -2189,7 +2462,7 @@ mod tests {
         fs::write(&credential, b"disposable ciphertext fixture").unwrap();
         server.save().unwrap();
         let per_key = serde_json::to_value(&server.settings.keys).unwrap();
-        let expiry = server.expiry.clone();
+        let expiry = recorded_expiry(&server).clone();
         for (lifetime, sleep) in [(900, true), (0, false), (31_536_000, true)] {
             let snapshot = json!(server.settings.global_rules());
             pending_editor(&mut server, &key, "settings.global");
@@ -2217,7 +2490,7 @@ mod tests {
                 lifetime
             );
             assert_eq!(server.settings.effective(&custom.id).lifetime_seconds, 45);
-            assert_eq!(server.expiry, expiry);
+            assert_eq!(recorded_expiry(&server), expiry);
             let loaded = agent::list(&server.backend()).unwrap();
             assert_eq!(loaded.len(), 1);
             assert!(loaded.contains_key(&key.id));
@@ -2233,7 +2506,7 @@ mod tests {
     fn approved_key_editor_controls_override_and_inheritance_without_reloading() {
         let (_directory, _agent, mut server, key, _) = fixture();
         server.settings.global.lifetime_seconds = 60;
-        let expiry = server.expiry.clone();
+        let expiry = recorded_expiry(&server).clone();
         for (inherits, lifetime) in [(false, 900), (false, 0), (true, 900)] {
             pending_editor(&mut server, &key, "settings.key");
             let value = &server.active.as_ref().unwrap().job.value;
@@ -2252,7 +2525,7 @@ mod tests {
                 server.settings.effective(&key.id).lifetime_seconds,
                 if inherits { 60 } else { lifetime }
             );
-            assert_eq!(server.expiry, expiry);
+            assert_eq!(recorded_expiry(&server), expiry);
             assert_eq!(agent::list(&server.backend()).unwrap().len(), 1);
         }
     }
@@ -2395,7 +2668,7 @@ mod tests {
         server.save().unwrap();
         let settings = serde_json::to_value(&server.settings).unwrap();
         let disk = fs::read(server.state_directory.join("settings.json")).unwrap();
-        let expiry = server.expiry.clone();
+        let expiry = recorded_expiry(&server).clone();
         let blocker = directory.path().join("not-a-directory");
         fs::write(&blocker, b"disposable write failure fixture").unwrap();
         for operation in ["settings.global", "settings.key"] {
@@ -2414,7 +2687,7 @@ mod tests {
                 fs::read(server.state_directory.join("settings.json")).unwrap(),
                 disk
             );
-            assert_eq!(server.expiry, expiry);
+            assert_eq!(recorded_expiry(&server), expiry);
             assert_eq!(agent::list(&server.backend()).unwrap().len(), 1);
         }
     }
@@ -2422,7 +2695,7 @@ mod tests {
     #[test]
     fn policy_parent_sync_failure_reports_partial_and_preserves_applied_policy() {
         let (_directory, _agent, mut server, key, _) = fixture();
-        let expiry = server.expiry.clone();
+        let expiry = recorded_expiry(&server).clone();
         server.save_global_settings = |path, settings| {
             platform::save_json_outcome_with_parent_sync(path, settings, |parent| {
                 let replaced: Settings =
@@ -2447,7 +2720,7 @@ mod tests {
         );
         assert_eq!(server.settings.global.lifetime_seconds, 900);
         assert!(server.settings.revoke_on_sleep);
-        assert_eq!(server.expiry, expiry);
+        assert_eq!(recorded_expiry(&server), expiry);
         assert_eq!(agent::list(&server.backend()).unwrap().len(), 1);
     }
 
@@ -2572,7 +2845,7 @@ mod tests {
         use std::os::unix::net::UnixStream;
         for already_added in [false, true] {
             let (directory, _agent, mut server, prior, pending) = fixture();
-            let expiry = server.expiry.clone();
+            let expiry = recorded_expiry(&server).clone();
             if already_added {
                 add(&server, &pending);
             }
@@ -2659,7 +2932,7 @@ mod tests {
             let loaded = agent::list(&server.backend()).unwrap();
             assert_eq!(loaded.len(), 1);
             assert!(loaded.contains_key(&prior.id));
-            assert_eq!(server.expiry, expiry);
+            assert_eq!(recorded_expiry(&server), expiry);
         }
     }
 
@@ -2667,7 +2940,7 @@ mod tests {
     fn sleep_marker_rejects_user_actions_before_loaded_key_shortcut_or_native_launch() {
         let (_directory, _agent, mut server, loaded, _) = fixture();
         let owner = peer(&server);
-        let expiry = server.expiry.clone();
+        let expiry = recorded_expiry(&server).clone();
         fs::write(&server.sleep_marker, b"disposable marker").unwrap();
         assert!(!server.sleeping); // The event loop has not latched it yet.
         let mut unlock = Command::new("keys.unlock");
@@ -2698,7 +2971,7 @@ mod tests {
         assert_eq!(panel["sleep_preparing"], true);
         assert_eq!(panel["session_available"], false);
         assert!(server.active.is_none() && server.history.is_empty());
-        assert_eq!(server.expiry, expiry);
+        assert_eq!(recorded_expiry(&server), expiry);
         assert_eq!(agent::list(&server.backend()).unwrap().len(), 1);
         fs::remove_file(&server.sleep_marker).unwrap();
         assert_eq!(
@@ -2714,7 +2987,7 @@ mod tests {
         for operation in ["unlock", "sync", "encrypt", "rules.key", "unbind", "scan"] {
             let (_directory, _agent, mut server, prior, pending) = fixture();
             server.settings.revoke_on_sleep = true;
-            let expiry = server.expiry.clone();
+            let expiry = recorded_expiry(&server).clone();
             pending_confirmation(&mut server, &pending, operation, Value::Null);
             let pid = server.active.as_ref().unwrap().child.id();
             fs::write(&server.sleep_marker, b"disposable sleep marker").unwrap();
@@ -2761,7 +3034,7 @@ mod tests {
             let loaded = agent::list(&server.backend()).unwrap();
             assert_eq!(loaded.len(), 1);
             assert!(loaded.contains_key(&prior.id));
-            assert_eq!(server.expiry, expiry);
+            assert_eq!(recorded_expiry(&server), expiry);
             assert_eq!(
                 agent::exchange(&server.backend(), &[19])
                     .unwrap()
@@ -2775,7 +3048,7 @@ mod tests {
             assert!(server.reconcile().unwrap().is_empty());
             server.tick().unwrap();
             assert!(agent::list(&server.backend()).unwrap().is_empty());
-            assert!(server.expiry.is_empty() && server.active.is_none());
+            assert!(recorded_expiry(&server).is_empty() && server.active.is_none());
         }
     }
 
@@ -2873,7 +3146,7 @@ mod tests {
             .rules = Some(Rules {
             lifetime_seconds: 45,
         });
-        let expiry = server.expiry[&key.id];
+        let expiry = recorded_expiry(&server)[&key.id];
         let generation = server.guard.lock().unwrap().generation;
         for now in 0..3 {
             server.gate.check("old-window", now).unwrap();
@@ -2903,7 +3176,7 @@ mod tests {
             )
             .unwrap();
             assert_eq!(saved.keys[&key.id].fingerprint_mode, desired);
-            assert_eq!(server.expiry[&key.id], expiry);
+            assert_eq!(recorded_expiry(&server)[&key.id], expiry);
             assert_eq!(agent::list(&server.backend()).unwrap().len(), 1);
             assert_eq!(
                 fs::read(&credential).unwrap(),
@@ -2925,7 +3198,7 @@ mod tests {
                 .is_err()
         );
         assert_eq!(serde_json::to_value(&server.settings).unwrap(), before);
-        assert_eq!(server.expiry[&key.id], expiry);
+        assert_eq!(recorded_expiry(&server)[&key.id], expiry);
         assert_eq!(agent::list(&server.backend()).unwrap().len(), 1);
     }
 
@@ -2935,9 +3208,12 @@ mod tests {
         let owner = peer(&server);
         add(&server, &other);
         server
-            .expiry
-            .insert(other.id.clone(), Some(platform::now() + 45));
-        let other_expiry = server.expiry[&other.id];
+            .guard
+            .lock()
+            .unwrap()
+            .lifetimes
+            .insert(other.id.clone(), agent::Lifetime::new(45).unwrap());
+        let other_expiry = recorded_expiry(&server)[&other.id];
         let credential = server.credential_path(&key.id);
         fs::write(&credential, b"disposable ciphertext fixture").unwrap();
         server
@@ -2965,8 +3241,8 @@ mod tests {
             let loaded = agent::list(&server.backend()).unwrap();
             assert_eq!(loaded.len(), 1);
             assert!(loaded.contains_key(&other.id));
-            assert!(!server.expiry.contains_key(&key.id));
-            assert_eq!(server.expiry[&other.id], other_expiry);
+            assert!(!recorded_expiry(&server).contains_key(&key.id));
+            assert_eq!(recorded_expiry(&server)[&other.id], other_expiry);
             assert_eq!(
                 fs::read(server.state_directory.join("settings.json")).unwrap(),
                 settings
@@ -2985,7 +3261,7 @@ mod tests {
         for already_added in [false, true] {
             let (directory, _agent, mut server, prior, pending) = fixture();
             let owner = peer(&server);
-            let prior_expiry = server.expiry[&prior.id];
+            let prior_expiry = recorded_expiry(&server)[&prior.id];
             if already_added {
                 add(&server, &pending);
             }
@@ -3039,7 +3315,7 @@ mod tests {
             let loaded = agent::list(&server.backend()).unwrap();
             assert_eq!(loaded.len(), 1);
             assert!(loaded.contains_key(&prior.id));
-            assert_eq!(server.expiry[&prior.id], prior_expiry);
+            assert_eq!(recorded_expiry(&server)[&prior.id], prior_expiry);
         }
     }
 
@@ -3114,7 +3390,7 @@ mod tests {
                 }
             );
             assert!(agent::list(&server.backend()).unwrap().is_empty());
-            assert!(!server.expiry.contains_key(&key.id));
+            assert!(!recorded_expiry(&server).contains_key(&key.id));
         }
     }
 
@@ -3161,7 +3437,7 @@ mod tests {
             server.history["pending-request"]["error_code"],
             "agent_unavailable"
         );
-        assert!(server.expiry.is_empty());
+        assert!(recorded_expiry(&server).is_empty());
         assert!(agent::list(&server.backend()).unwrap().is_empty());
         server.tick().unwrap();
         assert!(agent::list(&server.backend()).unwrap().is_empty());
@@ -3182,6 +3458,12 @@ mod tests {
             "agent_reset_failed"
         );
         assert!(server.agent_reset_failed && server.active.is_none());
+        assert!(server.gate.active.is_none());
+        assert_eq!(server.history["pending-request"]["state"], "error");
+        assert_eq!(
+            server.history["pending-request"]["error_code"],
+            "agent_reset_failed"
+        );
         let guard = server.guard.lock().unwrap();
         assert!(guard.blocked && guard.worker_group.is_none());
         assert!(guard.retired_worker_groups.contains(&(pid as i32)));
@@ -3190,13 +3472,13 @@ mod tests {
             std::io::Error::last_os_error().raw_os_error(),
             Some(libc::ESRCH)
         );
-        assert!(server.expiry.is_empty());
+        assert!(guard.lifetimes.is_empty());
     }
 
     #[test]
     fn session_changes_preserve_loaded_identity_generation_and_lifetime() {
         let (_directory, _agent, mut server, prior, _) = fixture();
-        let expiry = server.expiry[&prior.id];
+        let expiry = recorded_expiry(&server)[&prior.id];
         for session in [
             Session {
                 available: true,
@@ -3215,7 +3497,7 @@ mod tests {
                     .unwrap()
                     .contains_key(&prior.id)
             );
-            assert_eq!(server.expiry[&prior.id], expiry);
+            assert_eq!(recorded_expiry(&server)[&prior.id], expiry);
             assert_eq!(server.guard.lock().unwrap().generation, 0);
         }
     }
@@ -3223,7 +3505,7 @@ mod tests {
     #[test]
     fn locked_session_cancels_prompt_without_revoking_preloaded_identity() {
         let (_directory, _agent, mut server, prior, pending) = fixture();
-        let expiry = server.expiry[&prior.id];
+        let expiry = recorded_expiry(&server)[&prior.id];
         let pid = pending_request(&mut server, pending, false);
         server
             .update_session(Session {
@@ -3248,7 +3530,7 @@ mod tests {
                 .contains(&(pid as i32))
         );
         assert_eq!(agent::list(&server.backend()).unwrap().len(), 1);
-        assert_eq!(server.expiry[&prior.id], expiry);
+        assert_eq!(recorded_expiry(&server)[&prior.id], expiry);
         let rejected = server.request(None, "scan", &Command::new("scan"), "fixture");
         assert_eq!(rejected.unwrap_err().0, "session_locked_or_unavailable");
     }
@@ -3256,7 +3538,7 @@ mod tests {
     #[test]
     fn unavailable_session_removes_only_unfinished_load() {
         let (_directory, _agent, mut server, prior, pending) = fixture();
-        let expiry = server.expiry[&prior.id];
+        let expiry = recorded_expiry(&server)[&prior.id];
         add(&server, &pending);
         pending_request(&mut server, pending.clone(), true);
         server.update_session(Session::default()).unwrap();
@@ -3264,7 +3546,7 @@ mod tests {
         assert_eq!(loaded.len(), 1);
         assert!(loaded.contains_key(&prior.id));
         assert!(!loaded.contains_key(&pending.id));
-        assert_eq!(server.expiry[&prior.id], expiry);
+        assert_eq!(recorded_expiry(&server)[&prior.id], expiry);
         assert!(!server.agent_reset_failed);
     }
 }

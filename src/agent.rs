@@ -76,6 +76,33 @@ pub fn remove_key(path: &Path, key: &keys::Key) -> Result<()> {
             .map_err(|_| Error("invalid_key"))?,
     )
 }
+// This is the maximum access window granted by KeyController. OpenSSH still
+// applies its own -t constraint; an external re-add cannot extend this window.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Lifetime {
+    pub expires_at: Option<u64>,
+    pub deadline: Option<Duration>,
+}
+pub fn boot_now() -> Result<Duration> {
+    let mut time = std::mem::MaybeUninit::<libc::timespec>::uninit();
+    if unsafe { libc::clock_gettime(libc::CLOCK_BOOTTIME, time.as_mut_ptr()) } != 0 {
+        return Err(Error("clock_unavailable"));
+    }
+    let time = unsafe { time.assume_init() };
+    Ok(Duration::new(time.tv_sec as u64, time.tv_nsec as u32))
+}
+impl Lifetime {
+    pub fn new(seconds: u32) -> Result<Self> {
+        Ok(Self {
+            expires_at: (seconds > 0).then(|| platform::now() + seconds as u64),
+            deadline: if seconds > 0 {
+                Some(boot_now()? + Duration::from_secs(seconds as u64))
+            } else {
+                None
+            },
+        })
+    }
+}
 #[derive(Default)]
 pub struct Guard {
     pub blocked: bool,
@@ -84,10 +111,74 @@ pub struct Guard {
     pub sleep_marker: Option<std::path::PathBuf>,
     pub generation: u64,
     pub worker_group: Option<i32>,
-    pub external_epoch: u64,
+    pub managed_key: Option<(String, u32)>,
+    pub lifetimes: BTreeMap<String, Lifetime>,
+    pub agent_locked: bool,
+    pub reset_required: bool,
     pub managed_added_at: Option<u64>,
     pub managed_add_uncertain: bool,
     pub retired_worker_groups: BTreeSet<i32>,
+}
+impl Guard {
+    fn require_reset(&mut self) {
+        if !self.reset_required {
+            self.generation = self.generation.wrapping_add(1);
+        }
+        self.blocked = true;
+        self.reset_required = true;
+    }
+    fn external_add(&mut self) {
+        // Private ADD packets remain opaque. Finite managed windows are still
+        // enforced; an unlimited record cannot describe an unknown replacement.
+        self.lifetimes
+            .retain(|_, lifetime| lifetime.deadline.is_some());
+    }
+}
+// Called under the same guard as every forwarded request, including SIGN.
+// A slow helper event loop cannot allow signing beyond a managed deadline.
+pub fn reap_deadlines(path: &Path, guard: &mut Guard) -> Result<()> {
+    let result = (|| {
+        if guard.reset_required {
+            return Err(Error("agent_reset_required"));
+        }
+        if !guard
+            .lifetimes
+            .values()
+            .any(|lifetime| lifetime.deadline.is_some())
+        {
+            return Ok(());
+        }
+        loop {
+            let now = boot_now()?;
+            let expired: Vec<_> = guard
+                .lifetimes
+                .iter()
+                .filter(|(_, lifetime)| lifetime.deadline.is_some_and(|deadline| now >= deadline))
+                .map(|(id, _)| id.clone())
+                .collect();
+            if expired.is_empty() {
+                return Ok(());
+            }
+            // A locked OpenSSH agent hides its keys and refuses selective removal.
+            // Only a full reset can prove that an expired hidden key is gone.
+            if guard.agent_locked {
+                return Err(Error("agent_reset_required"));
+            }
+            let loaded = list(path)?;
+            for id in expired {
+                if let Some(public) = loaded.get(&id) {
+                    remove(path, public)?;
+                }
+                guard.lifetimes.remove(&id);
+            }
+            // Backend I/O may cross another key's deadline. Recheck before
+            // forwarding the caller's packet, not just on the next request.
+        }
+    })();
+    if result.is_err() {
+        guard.require_reset();
+    }
+    result
 }
 pub fn peer(stream: &UnixStream) -> Result<libc::ucred> {
     let mut u = libc::ucred {
@@ -177,23 +268,23 @@ pub fn proxy_at(
                 let mut socket = socket;
                 let _ = socket.set_read_timeout(Some(Duration::from_secs(30)));
                 let _ = socket.set_write_timeout(Some(Duration::from_secs(1)));
-                let run = || -> Result<()> {
+                let mut run = || -> Result<()> {
                     // Keep one backend connection per frontend connection:
                     // OpenSSH session-bind and destination constraints depend on it.
-                    let mut backend = UnixStream::connect(path)?;
+                    let mut backend = UnixStream::connect(&path)?;
                     backend.set_read_timeout(Some(Duration::from_millis(500)))?;
                     backend.set_write_timeout(Some(Duration::from_millis(500)))?;
                     loop {
                         let message = packet(&mut socket)?;
-                        let mutation =
-                            matches!(message[0], 17 | 18 | 19 | 20 | 21 | 22 | 23 | 25 | 26);
                         let mut g = guard.lock().map_err(|_| Error("guard_failed"))?;
                         if generation != g.generation {
                             return Err(Error("agent_reset"));
                         }
-                        let adding = matches!(message[0], 17 | 20 | 22 | 23 | 25 | 26);
+                        reap_deadlines(&path, &mut g)?;
+                        let adding = matches!(message[0], 17 | 20 | 25 | 26);
+                        let opening = adding || message[0] == 23;
                         let group = unsafe { libc::getpgid(cred.pid) };
-                        if adding
+                        if opening
                             && (g.blocked
                                 || g.sleep_marker
                                     .as_deref()
@@ -210,15 +301,59 @@ pub fn proxy_at(
                             // Cancellation must reset only in that ambiguous case.
                             g.managed_add_uncertain = true;
                         }
-                        write(&mut backend, &message)?;
-                        let result = packet(&mut backend)?;
+                        let result =
+                            write(&mut backend, &message).and_then(|()| packet(&mut backend));
+                        if adding
+                            && !managed
+                            && !result.as_ref().is_ok_and(|reply| reply.as_slice() == [5])
+                        {
+                            g.external_add();
+                        }
+                        // An unanswered LOCK may have succeeded. Keep hidden
+                        // identities' windows until a confirmed unlock/reset.
+                        if message[0] == 22 && result.is_err() {
+                            g.agent_locked = true;
+                        }
+                        let result = result?;
                         if adding && managed && matches!(result.as_slice(), [5] | [6]) {
                             g.managed_add_uncertain = false;
                         }
-                        if mutation && result.as_slice() == [6] && !managed {
-                            g.external_epoch = g.external_epoch.wrapping_add(1);
-                        } else if adding && result.as_slice() == [6] {
-                            g.managed_added_at = Some(platform::now());
+                        if result.as_slice() == [6] {
+                            match message[0] {
+                                9 | 19 => g.lifetimes.clear(),
+                                18 => {
+                                    // REMOVE carries only a public key blob.
+                                    // Never inspect the private fields of ADD.
+                                    let mut fields = &message[1..];
+                                    if let Ok(public) = keys::field(&mut fields) {
+                                        g.lifetimes.remove(&keys::fingerprint(public));
+                                    }
+                                }
+                                21 => {
+                                    // Token removal may affect several keys;
+                                    // compare only the original agent's public list.
+                                    if let Ok(loaded) = list(&path) {
+                                        g.lifetimes.retain(|id, _| loaded.contains_key(id));
+                                    }
+                                }
+                                22 => g.agent_locked = true,
+                                23 => g.agent_locked = false,
+                                _ => (),
+                            }
+                            if adding && managed {
+                                g.managed_added_at = Some(platform::now());
+                                if let Some((id, seconds)) = g.managed_key.clone() {
+                                    match Lifetime::new(seconds) {
+                                        Ok(lifetime) => {
+                                            g.lifetimes.insert(id, lifetime);
+                                        }
+                                        Err(error) => {
+                                            g.require_reset();
+                                            return Err(error);
+                                        }
+                                    }
+                                }
+                            }
                         }
                         drop(g);
                         write(&mut socket, &result)?;
