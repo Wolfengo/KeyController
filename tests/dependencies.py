@@ -58,6 +58,8 @@ class PackageDatabase:
             return result(stdout=str(self.comparison) + "\n")
         if command[:2] == [dependencies.SYSTEMCTL, "is-enabled"]:
             return result(stdout="enabled\n")
+        if command == [dependencies.PROMPT, "--check-runtime"]:
+            return result()
         raise AssertionError("Unexpected package command: " + repr(command))
 
 
@@ -87,8 +89,36 @@ class DependencyTests(unittest.TestCase):
         self.assertEqual(status["state"], "ready")
         self.assertEqual(status["missing"], [])
         self.assertEqual(database.calls[0], [dependencies.PACMAN, "-T", *dependencies.REQUIREMENTS])
-        self.assertEqual(len(database.calls), 3)
+        self.assertEqual(len(database.calls), 4)
+        self.assertIn([dependencies.PROMPT, "--check-runtime"], database.calls)
         self.assertFalse(status["setup_required"])
+
+    def test_installed_but_unloadable_prompt_is_not_ready(self):
+        database = PackageDatabase()
+        def query(command):
+            if command == [dependencies.PROMPT, "--check-runtime"]:
+                return result(1, "private diagnostic", "Qt_6.12 not found")
+            return database(command)
+        status = self.check(query)
+        self.assertEqual(status["state"], "error")
+        self.assertEqual(status["error_code"], "prompt_runtime_unavailable")
+        self.assertFalse(status["installable"])
+        self.assertNotIn("private diagnostic", json.dumps(status))
+        self.assertNotIn("Qt_6.12", json.dumps(status))
+        self.assertFalse(any(command[0] == dependencies.SYSTEMCTL for command in database.calls))
+
+    def test_missing_packages_do_not_run_prompt(self):
+        database = PackageDatabase([dependencies.HELPER_REQUIREMENT])
+        self.assertEqual(self.check(database)["state"], "missing")
+        self.assertNotIn([dependencies.PROMPT, "--check-runtime"], database.calls)
+
+    def test_runtime_probe_timeout_fails_with_stable_error(self):
+        database = PackageDatabase()
+        def query(command):
+            if command == [dependencies.PROMPT, "--check-runtime"]:
+                raise dependencies.DependencyError("package_check_timeout")
+            return database(command)
+        self.assertEqual(self.check(query)["error_code"], "prompt_runtime_unavailable")
 
     def test_fingerprint_package_is_optional(self):
         status = self.check(PackageDatabase(missing=["fprintd"]))
@@ -850,15 +880,15 @@ case "$1" in
             [ -x '{python}' ] && exit 0
             printf 'python\\n'; exit 127
         fi
-        if [ "$2" = 'keycontroller>=0.1.1-1' ]; then
-            {'exit 0' if helper == 'installed' else "printf 'keycontroller>=0.1.1-1\\n'; exit 127"}
+        if [ "$2" = 'keycontroller>=0.1.3-1' ]; then
+            {'exit 0' if helper == 'installed' else "printf 'keycontroller>=0.1.3-1\\n'; exit 127"}
         fi
         exit 2 ;;
     -Si)
         if [ "$2" = python ]; then
             printf 'Repository : extra\\nName : python\\nVersion : 3.14.0-1\\n'
         elif [ "$2" = keycontroller ]; then
-            {'exit 1' if helper == 'absent' else "printf 'Repository : omarchy\\nName : keycontroller\\nVersion : 0.1.1-1\\n'"}
+            {'exit 1' if helper == 'absent' else "printf 'Repository : omarchy\\nName : keycontroller\\nVersion : 0.1.3-1\\n'"}
         else exit 2; fi ;;
     -S)
         [ {outcome} = 0 ] || exit {outcome}

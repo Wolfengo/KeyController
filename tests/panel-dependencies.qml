@@ -92,7 +92,7 @@ ShellRoot {
       test.check(!panel.dependenciesReady && button.enabled, "unfinished migration was considered ready")
       test.deps.fail("invalid_response")
       test.check(!button.enabled, "failed setup check left setup action enabled")
-      test.deps.accept(test.report("missing", [{name:"keycontroller",requirement:"keycontroller>=0.1.1-1",repository:null,available:false,reason:"repository_unavailable"}], false))
+      test.deps.accept(test.report("missing", [{name:"keycontroller",requirement:"keycontroller>=0.1.3-1",repository:null,available:false,reason:"repository_unavailable"}], false))
       test.check(!button.enabled && !row.visible, "unavailable helper offered installation")
       test.check(button.text === "Package not yet available", "unavailable helper has misleading install action")
       var packageStatus = test.find(panel, "ssh-keys-package-status")
@@ -102,6 +102,9 @@ ShellRoot {
       test.check(!packageStatus.visible, "stale publication link shown for unrelated errors")
       test.deps.accept(test.report("error", [], false, false, "unsupported_repositories"))
       test.check(!button.enabled && test.find(panel, "ssh-keys-dependencies-message").text.indexOf("Other repositories were detected") >= 0, "custom repositories did not explain why installation is blocked")
+      test.deps.accept(test.report("error", [], false, false, "prompt_runtime_unavailable"))
+      test.check(!panel.dependenciesReady && !button.enabled && !row.visible, "unloadable prompt exposed key controls")
+      test.check(test.find(panel, "ssh-keys-dependencies-message").text.indexOf("cannot run with the installed libraries") >= 0, "unloadable prompt did not explain runtime incompatibility")
       test.deps.accept(test.report("ready"))
       var malformed = test.report("ready")
       malformed.setup_required = "false"

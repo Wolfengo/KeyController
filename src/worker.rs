@@ -14,7 +14,7 @@ use std::{
     fs::File,
     io::{Read, Seek, SeekFrom, Write},
     os::{fd::AsRawFd, unix::net::UnixStream},
-    process::Stdio,
+    process::{Child, Command, Stdio},
     sync::{
         Arc,
         atomic::{AtomicBool, Ordering},
@@ -444,6 +444,61 @@ fn line(stream: &mut UnixStream) -> Result<Zeroizing<Vec<u8>>> {
     }
     Err(Error("invalid_message"))
 }
+fn spawn_prompt(
+    mut command: Command,
+    ui_channel: UnixStream,
+    display: UnixStream,
+    user: &User,
+) -> Result<Child> {
+    process::descriptors(
+        &mut command,
+        &[(ui_channel.as_raw_fd(), 3), (display.as_raw_fd(), 4)],
+        Some((user.uid, user.gid)),
+        false,
+    )?;
+    let child = command.spawn().map_err(|_| Error("prompt_unavailable"));
+    // Command owns the pre_exec closure and its duplicated descriptors even
+    // after spawn. Release every parent copy before waiting for native IPC,
+    // otherwise an exited prompt cannot produce EOF on the worker's channel.
+    drop(command);
+    drop(ui_channel);
+    drop(display);
+    child
+}
+fn prompt_answer(
+    mut ui: Child,
+    channel: &mut UnixStream,
+    job: &impl Serialize,
+) -> Result<(Child, Answer)> {
+    let result = (|| -> Result<Answer> {
+        serde_json::to_writer(&mut *channel, job).map_err(|_| Error("prompt_unavailable"))?;
+        channel
+            .write_all(b"\n")
+            .map_err(|_| Error("prompt_unavailable"))?;
+        let bytes = line(channel).map_err(|error| {
+            if error.0 == "io_error" {
+                Error("prompt_unavailable")
+            } else {
+                error
+            }
+        })?;
+        Ok(serde_json::from_slice(&bytes)?)
+    })();
+    match result {
+        Ok(answer) if answer.consent => Ok((ui, answer)),
+        Ok(_) => {
+            let _ = process::wait(ui, 3);
+            Err(Error("cancelled"))
+        }
+        Err(error) => {
+            // The native process may already have exited, or may be stuck
+            // after a broken/invalid reply. Do not leave it running or zombie.
+            let _ = ui.kill();
+            let _ = ui.wait();
+            Err(error)
+        }
+    }
+}
 pub fn run(job: Job) -> Result<Value> {
     // Reject retired/unknown jobs before display setup or any child process.
     if !matches!(
@@ -479,23 +534,8 @@ pub fn run(job: Job) -> Result<Value> {
         .env("WAYLAND_SOCKET", "4")
         .env("QT_QPA_PLATFORM", "wayland")
         .env("SSH_KEYS_UI_LANGUAGE", crate::locale::system_ui_language());
-    process::descriptors(
-        &mut c,
-        &[(ui_channel.as_raw_fd(), 3), (display.as_raw_fd(), 4)],
-        Some((job.user.uid, job.user.gid)),
-        false,
-    )?;
-    let mut ui = c.spawn()?;
-    drop(ui_channel);
-    drop(display);
-    serde_json::to_writer(&mut channel, &job)?;
-    channel.write_all(b"\n")?;
-    let bytes = line(&mut channel)?;
-    let answer: Answer = serde_json::from_slice(&bytes)?;
-    if !answer.consent {
-        let _ = ui.wait();
-        return Err(Error("cancelled"));
-    }
+    let ui = spawn_prompt(c, ui_channel, display, &job.user)?;
+    let (ui, answer) = prompt_answer(ui, &mut channel, &job)?;
     let done = Arc::new(AtomicBool::new(false));
     let flag = done.clone();
     let mut cancel = channel.try_clone()?;
@@ -671,6 +711,132 @@ mod tests {
     }
     fn user() -> User {
         User::get(unsafe { libc::getuid() }).unwrap()
+    }
+
+    fn prompt_fixture(script: &str) -> (UnixStream, UnixStream, Child) {
+        let (channel, ui_channel) = UnixStream::pair().unwrap();
+        let (compositor, display) = UnixStream::pair().unwrap();
+        channel
+            .set_read_timeout(Some(Duration::from_secs(2)))
+            .unwrap();
+        channel
+            .set_write_timeout(Some(Duration::from_secs(2)))
+            .unwrap();
+        compositor
+            .set_read_timeout(Some(Duration::from_secs(2)))
+            .unwrap();
+        let mut command = process::clean_command("/usr/bin/sh");
+        command.args(["-c", script]);
+        let child = spawn_prompt(command, ui_channel, display, &user()).unwrap();
+        (channel, compositor, child)
+    }
+
+    fn assert_prompt_reaped(pid: u32) {
+        // A killed child is not sufficient: it must not remain a zombie.
+        let result = unsafe { libc::waitpid(pid as i32, std::ptr::null_mut(), libc::WNOHANG) };
+        assert_eq!(result, -1);
+        assert_eq!(
+            std::io::Error::last_os_error().raw_os_error(),
+            Some(libc::ECHILD)
+        );
+    }
+
+    #[test]
+    fn exited_prompt_closes_both_channels_including_pre_exec_duplicates() {
+        let (mut channel, mut compositor, mut child) = prompt_fixture("exit 1");
+        assert!(!child.wait().unwrap().success());
+        let mut byte = [0];
+        // A retained Command/pre_exec descriptor would time out here instead
+        // of reporting EOF, exactly as with an incompatible native loader.
+        assert_eq!(channel.read(&mut byte).unwrap(), 0);
+        assert_eq!(compositor.read(&mut byte).unwrap(), 0);
+        assert_prompt_reaped(child.id());
+    }
+
+    #[test]
+    fn missing_prompt_returns_stable_unavailable_without_a_child() {
+        let temporary = tempfile::tempdir().unwrap();
+        let command =
+            process::clean_command(temporary.path().join("absent-prompt").to_str().unwrap());
+        let (mut channel, ui_channel) = UnixStream::pair().unwrap();
+        let (mut compositor, display) = UnixStream::pair().unwrap();
+        assert_eq!(
+            spawn_prompt(command, ui_channel, display, &user())
+                .unwrap_err()
+                .0,
+            "prompt_unavailable"
+        );
+        let mut byte = [0];
+        assert_eq!(channel.read(&mut byte).unwrap(), 0);
+        assert_eq!(compositor.read(&mut byte).unwrap(), 0);
+    }
+
+    #[test]
+    fn prompt_exit_before_complete_answer_returns_unavailable_and_is_reaped() {
+        for script in [
+            "exit 1",
+            "IFS= read -r job <&3; exit 1",
+            "IFS= read -r job <&3; printf '{' >&3; exit 1",
+        ] {
+            let (mut channel, _compositor, child) = prompt_fixture(script);
+            let pid = child.id();
+            assert_eq!(
+                prompt_answer(child, &mut channel, &json!({"operation":"fixture"}))
+                    .err()
+                    .unwrap()
+                    .0,
+                "prompt_unavailable"
+            );
+            assert_prompt_reaped(pid);
+        }
+    }
+
+    #[test]
+    fn invalid_prompt_answer_terminates_and_reaps_native_process() {
+        let (mut channel, _compositor, child) = prompt_fixture(
+            "IFS= read -r job <&3; printf 'not-json\\n' >&3; exec /usr/bin/sleep 30",
+        );
+        let pid = child.id();
+        assert_eq!(
+            prompt_answer(child, &mut channel, &json!({"operation":"fixture"}))
+                .err()
+                .unwrap()
+                .0,
+            "invalid_json"
+        );
+        assert_prompt_reaped(pid);
+    }
+
+    #[test]
+    fn explicit_prompt_cancellation_remains_cancelled_and_is_reaped() {
+        let (mut channel, _compositor, child) = prompt_fixture(
+            "IFS= read -r job <&3; printf '%s\\n' '{\"consent\":false,\"mode\":\"confirm\",\"passphrase\":\"\",\"confirmation\":\"\"}' >&3",
+        );
+        let pid = child.id();
+        assert_eq!(
+            prompt_answer(child, &mut channel, &json!({"operation":"fixture"}))
+                .err()
+                .unwrap()
+                .0,
+            "cancelled"
+        );
+        assert_prompt_reaped(pid);
+    }
+
+    #[test]
+    fn valid_prompt_answer_keeps_native_process_and_private_channel_open() {
+        let (mut channel, _compositor, child) = prompt_fixture(
+            "IFS= read -r job <&3; printf '%s\\n' '{\"consent\":true,\"mode\":\"confirm\",\"passphrase\":\"\",\"confirmation\":\"\"}' >&3; exec /usr/bin/sleep 30",
+        );
+        let (mut child, answer) =
+            prompt_answer(child, &mut channel, &json!({"operation":"fixture"})).unwrap();
+        assert!(answer.consent);
+        assert_eq!(answer.mode, "confirm");
+        assert!(child.try_wait().unwrap().is_none());
+        channel.write_all(b"{\"state\":\"completed\"}\n").unwrap();
+        child.kill().unwrap();
+        child.wait().unwrap();
+        assert_prompt_reaped(child.id());
     }
 
     #[test]

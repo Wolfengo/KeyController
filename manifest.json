@@ -2,10 +2,10 @@
   "schemaVersion": 1,
   "id": "org.omarchy.keycontroller",
   "name": "KeyController",
-  "version": "0.3.0",
+  "version": "0.4.0",
   "author": "KeyController contributors",
   "license": "MIT AND Apache-2.0",
-  "description": "OpenSSH keys with per-key passphrase and fingerprint unlock",
+  "description": "Let AI agents, apps and deployment scripts ask for SSH access, then unlock with your fingerprint or key passphrase. Manage existing keys from the Omarchy bar with live search, per-key countdowns, one-click revocation and optional revoke-before-sleep. Works with the standard OpenSSH agent for SSH and Git, and follows your Omarchy theme.",
   "repository": "https://github.com/Wolfengo/KeyController",
   "kinds": [
     "bar-widget"
@@ -15,7 +15,7 @@
   },
   "barWidget": {
     "displayName": "KeyController",
-    "description": "Manage local SSH key access",
+    "description": "SSH keys, fingerprint unlock and access timers",
     "category": "System",
     "defaultSection": "right",
     "allowMultiple": false

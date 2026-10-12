@@ -19,7 +19,7 @@ import subprocess
 import sys
 
 
-HELPER_REQUIREMENT = "keycontroller>=0.1.1-1"
+HELPER_REQUIREMENT = "keycontroller>=0.1.3-1"
 REQUIREMENTS = (
     HELPER_REQUIREMENT, "openssh>=10.5p1", "qt6-base", "qt6-svg",
     "qt6-wayland", "layer-shell-qt>=6.6", "systemd", "pam", "python", "polkit",
@@ -30,6 +30,7 @@ VERCMP = "/usr/bin/vercmp"
 SUDO = "/usr/bin/sudo"
 SETUP = "/usr/bin/keycontroller-setup"
 SYSTEMCTL = "/usr/bin/systemctl"
+PROMPT = "/usr/lib/ssh-keys/prompt"
 LEGACY_PLUGIN_ID = "org.omarchy.ssh-keys"
 LEGACY_PLUGIN_TARGET = "/usr/share/ssh-keys/plugin"
 QUERY_TIMEOUT = 8
@@ -47,7 +48,7 @@ class DependencyError(Exception):
 
 def query(command):
     try:
-        result = subprocess.run(command, capture_output=True, text=True,
+        result = subprocess.run(command, capture_output=True, text=True, stdin=subprocess.DEVNULL,
                                 env=QUERY_ENV, timeout=QUERY_TIMEOUT,
                                 close_fds=True, check=False)
     except subprocess.TimeoutExpired:
@@ -309,6 +310,15 @@ def check_dependencies(include_installing=True):
         missing = missing_requirements(REQUIREMENTS)
         status["optional"] = {"fprintd": {"installed": not missing_requirements(("fprintd",))}}
         if not missing:
+            # Package presence alone does not prove that a prebuilt native
+            # window can load against this machine's Qt libraries. This mode
+            # does not open a window or access keys, IPC, or authentication.
+            try:
+                runtime = query([PROMPT, "--check-runtime"])
+            except DependencyError:
+                raise DependencyError("prompt_runtime_unavailable") from None
+            if runtime.returncode:
+                raise DependencyError("prompt_runtime_unavailable")
             status.update(setup_status())
             status["state"] = "ready"
             return status
@@ -341,6 +351,9 @@ def installation_targets(status):
 
 
 MESSAGES = {
+    "prompt_runtime_unavailable": (
+        "Защищённое окно несовместимо с установленными библиотеками. Нужна сборка KeyController для вашей версии системы.",
+        "The protected window cannot run with the installed libraries. Use a KeyController build compatible with your system version."),
     "wizard_intro": ("KeyController: установка и настройка", "KeyController: install and set up"),
     "wizard_scope": (
         "Будут установлены недостающие пакеты из подключённых репозиториев и настроен основной SSH-агент. Изменяемые настройки сохраняются в резервной копии; явные исключения IdentityAgent сохраняются. Инструкции для установленных ИИ-агентов будут подключены.",

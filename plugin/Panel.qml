@@ -35,6 +35,14 @@ Panel {
   onActiveRequestChanged: if (!activeRequest) activeRequestKey = ""
   property string message: ""
   property bool showCandidates: false
+  property alias searchQuery: searchInput.text
+  readonly property string searchNeedle: searchQuery.toLowerCase()
+  onSearchQueryChanged: Qt.callLater(resetListScroll)
+  onShowCandidatesChanged: {
+    searchInput.clear()
+    Qt.callLater(resetListScroll)
+    if (opened && !settingsOpen) Qt.callLater(focusSearch)
+  }
   property bool inventoryReady: !manageIpc
   property bool scanned: !manageIpc
   property bool discoveryApproved: !manageIpc
@@ -59,9 +67,23 @@ Panel {
   readonly property bool launchingUnlock: submittingAction === "keys.unlock"
   readonly property bool requestBusy: launchingUnlock || activeRequest !== ""
   readonly property bool actionBusy: submittingAction !== "" || queuedCall !== null || (rpc.running && !isPoll(currentAction))
-  readonly property var visibleRows: showCandidates ? rows : rows.filter(function(k, i, a) {
+  readonly property var matchingRows: rows.filter(function(row) {
+    return !searchNeedle || [row.name, row.path, row.fingerprint].some(function(value) {
+      return String(value || "").toLowerCase().indexOf(searchNeedle) !== -1
+    })
+  })
+  readonly property var visibleRows: showCandidates ? matchingRows : matchingRows.filter(function(k, i, a) {
     return k.encrypted && a.findIndex(function(other) { return other.key_id === k.key_id && other.encrypted }) === i
   })
+  readonly property bool searchHasNoResults: searchQuery !== "" && visibleRows.length === 0
+    && rows.some(function(row) { return showCandidates || row.encrypted })
+
+  function resetListScroll() {
+    if (scroll.contentItem && scroll.contentItem.contentY !== undefined) scroll.contentItem.contentY = 0
+  }
+  function focusSearch() {
+    if (opened && searchInput.visible) searchInput.forceActiveFocus()
+  }
 
   function isPoll(action) { return action === "panel.list" || action === "requests.status" }
   function clearSubmission(action) {
@@ -254,6 +276,7 @@ Panel {
       helper_unavailable: root.t("Системный помощник KeyController недоступен"), agent_unavailable: root.t("Управляемый SSH-агент недоступен"),
       prompt_unavailable: root.t("Не удалось открыть защищённое окно. Попробуйте ещё раз"), prompt_failed: root.t("Защищённое окно завершилось с ошибкой"),
       worker_failed: root.t("Помощник не смог завершить запрос"), io_error: root.t("Не удалось завершить обмен с защищённым окном"),
+      request_expired: root.t("Время ожидания истекло"),
       session_locked_or_unavailable: root.t("Нужен активный разблокированный локальный сеанс"), biometric_denied: root.t("Отпечаток не подтверждён"),
       session_unavailable: root.t("Не удалось проверить защищённое соединение с Hyprland"),
       ptrace_protection_required: root.t("Для защиты ввода нужен kernel.yama.ptrace_scope ≥ 1"), hardening_failed: root.t("Не удалось включить защиту процесса"),
@@ -283,10 +306,12 @@ Panel {
     if (reply.operation === "unlock" && ["cancelled", "denied", "biometric_denied"].indexOf(code) !== -1) text += root.t(" · пауза 30 с")
     return text
   }
-  onOpenedChanged: if (opened) {
-    clockSeconds = Math.floor(Date.now() / 1000)
-    if (activeRequest) call("requests.status", null, null, activeRequest)
-    else refresh()
+  onOpenedChanged: {
+    if (opened) {
+      clockSeconds = Math.floor(Date.now() / 1000)
+      if (activeRequest) call("requests.status", null, null, activeRequest)
+      else refresh()
+    } else searchInput.clear()
   }
 
   Process {
@@ -427,7 +452,7 @@ Panel {
     padding: Style.space(20)
     contentWidth: popup.fittedContentWidth(Style.space(400))
     contentHeight: popup.fittedContentHeight(content.implicitHeight, Style.space(680))
-    focusTarget: content
+    focusTarget: searchInput.visible ? searchInput : content
     ColumnLayout {
       id: content
       anchors.fill: parent
@@ -436,6 +461,13 @@ Panel {
         if (root.settingsOpen) root.settingsOpen = false
         else if (root.showCandidates) root.showCandidates = false
         else root.close()
+      }
+      Keys.onPressed: function(event) {
+        if (event.key === Qt.Key_F && event.modifiers === Qt.ControlModifier && searchInput.visible) {
+          root.focusSearch()
+          searchInput.selectAll()
+          event.accepted = true
+        }
       }
 
       RowLayout {
@@ -511,8 +543,42 @@ Panel {
         KeyAction { text: root.t("Отмена"); enabled: !root.actionBusy; onClicked: root.call("requests.cancel", null, null, root.activeRequest) }
       }
 
+      RowLayout {
+        visible: root.dependenciesReady && root.inventoryReady && !root.needsInitialScan && !root.settingsOpen
+        Layout.fillWidth: true
+        spacing: Style.space(4)
+        TextField {
+          id: searchInput
+          objectName: "ssh-keys-search"
+          Layout.fillWidth: true
+          implicitHeight: Style.space(32)
+          placeholderText: root.t("Поиск по имени, пути или отпечатку")
+          Accessible.name: placeholderText
+          foreground: Color.popups.text
+          font.pixelSize: Style.font.bodySmall
+          selectByMouse: true
+          maximumLength: 4096
+          onVisibleChanged: if (visible) Qt.callLater(root.focusSearch)
+          Keys.onEscapePressed: function(event) {
+            if (text !== "") clear()
+            else event.accepted = false
+          }
+        }
+        KeyAction {
+          objectName: "ssh-keys-search-clear"
+          visible: root.searchQuery !== ""
+          implicitWidth: Style.space(30)
+          implicitHeight: Style.space(32)
+          bordered: false
+          iconText: "\uf00d"
+          tooltipText: root.t("Очистить поиск")
+          onClicked: { searchInput.clear(); root.focusSearch() }
+        }
+      }
+
       Controls.ScrollView {
         id: scroll
+        objectName: "ssh-keys-scroll"
         Layout.fillWidth: true
         Layout.fillHeight: true
         Layout.preferredHeight: Math.min(pages.implicitHeight, Style.space(500))
@@ -850,7 +916,14 @@ Panel {
                   anchors.centerIn: parent
                   spacing: Style.space(10)
                   KeyControllerIcon { anchors.horizontalCenter: parent.horizontalCenter; foreground: Util.alpha(Color.popups.text, 0.4) }
-                  Text { text: root.showCandidates ? root.t("Ключи не найдены") : root.t("Добавьте ключ через +"); font.family: Style.font.family; font.pixelSize: Style.font.bodySmall; color: Util.alpha(Color.popups.text, 0.6) }
+                  Text {
+                    objectName: "ssh-keys-empty-message"
+                    text: root.searchHasNoResults ? root.t("Нет совпадений")
+                      : root.showCandidates ? root.t("Ключи не найдены") : root.t("Добавьте ключ через +")
+                    font.family: Style.font.family
+                    font.pixelSize: Style.font.bodySmall
+                    color: Util.alpha(Color.popups.text, 0.6)
+                  }
                 }
               }
             }

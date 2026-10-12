@@ -1,17 +1,17 @@
 # KeyController
 
-**SSH key access, right from your Omarchy bar.**
+**Your SSH keys. Your fingerprint. Your timer.**
 
 > [!TIP]
-> **AI agents can request SSH key unlocks on their own.** When your agent needs SSH or Git access, it can ask KeyController to open the authentication window. You grant access with your fingerprint or the key's passphrase.
+> **AI agents can request SSH key unlocks on their own.** Applications and deployment scripts can ask too. You grant access with your fingerprint or the key's passphrase; the requesting tool receives the result.
 
-Unlock with a passphrase or fingerprint, choose how long a key stays available, and close access with a click.
+Find a key, unlock it, and watch its access timer count down — right from your Omarchy bar. Keep using your existing keys for SSH and Git, with one-click revocation when you're done.
 
 <p align="center">
-  <img src="preview.png" alt="KeyController showing three demonstration keys, their unlock methods and access states" width="500">
+  <img src="preview.png" alt="KeyController overview: searchable SSH key list with access countdowns, a fingerprint unlock request and a passphrase unlock request" width="1000">
 </p>
 
-<p align="center"><sub>Real interface, demonstration keys. Colors and typography follow your Omarchy theme.</sub></p>
+<p align="center"><sub>Real interface with demonstration keys. The two authentication views illustrate alternative unlock methods. Colors and typography follow your Omarchy theme.</sub></p>
 
 ## Unlock your way
 
@@ -51,7 +51,7 @@ Start with **one minute of access**, set a shared duration, or give individual k
 
 ## Keep the keys you already use
 
-KeyController finds existing keys in `~/.ssh`, including subfolders. It supports **Ed25519, RSA and ECDSA in OpenSSH format**. Before the first scan, the widget asks to search this folder and its subfolders. Refresh whenever you add or move a key.
+KeyController finds existing keys in `~/.ssh`, including subfolders. It supports **Ed25519, RSA and ECDSA in OpenSSH format**. Before the first scan, the widget asks to search this folder and its subfolders. Refresh whenever you add or move a key. Search by name, path or fingerprint: the list filters as you type.
 
 The **+** button lets you add a passphrase to an unencrypted key. Its public identity stays the same, so your servers' `authorized_keys` need no changes. Existing encrypted keys can be added without changing their passphrase.
 
@@ -69,10 +69,10 @@ The **+** button lets you add a passphrase to an unencrypted key. Its public ide
 For example, add an unlock request to a deployment script before its SSH step:
 
 ```sh
-kctrl keys unlock --key '<key-id>' --interactive --reason 'Deploy application' --json
+kctrl keys unlock --key '<key-id>' --interactive --reason 'Deploy application' --json || exit $?
 ```
 
-The script waits for your fingerprint or passphrase in your unlocked local desktop session, then continues only when the key is unlocked. The command returns immediately: if the result is `pending`, the script must track the returned request ID with `kctrl requests status` until `unlocked`, and stop on cancellation, denial, expiry or error. [CLI and request states](docs/api.md)
+The command waits while you use your fingerprint or passphrase in your unlocked local desktop session, then returns the result. A successful unlock lets the script continue; cancellation, denial, timeout or error stops this example before deployment. No polling loop is needed. `--no-wait` remains available for applications that track requests themselves. [CLI and request states](docs/api.md)
 
 Instructions for **Codex, Claude Code and OpenCode** are included and connected during setup when those clients are present. [Agent workflow](skills/keycontroller/SKILL.md)
 

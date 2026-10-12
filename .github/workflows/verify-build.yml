@@ -17,7 +17,7 @@ jobs:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
           persist-credentials: false
-      - name: Pin source and builder inputs
+      - name: Pin source and Omarchy stable builder inputs
         id: inputs
         shell: bash
         run: |
@@ -88,4 +88,6 @@ jobs:
             dist/SOURCE_DATE_EPOCH
             dist/BASE_IMAGE
             dist/BUILDER_IMAGE
+            dist/BUILD_REPOSITORIES
+            dist/BUILD_PACKAGES
           create-storage-record: false
