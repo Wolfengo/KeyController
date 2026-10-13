@@ -19,10 +19,10 @@ import subprocess
 import sys
 
 
-HELPER_REQUIREMENT = "keycontroller>=0.1.3-1"
+HELPER_REQUIREMENT = "keycontroller>=0.1.4-1"
 REQUIREMENTS = (
     HELPER_REQUIREMENT, "openssh>=10.5p1", "qt6-base", "qt6-svg",
-    "qt6-wayland", "layer-shell-qt>=6.6", "systemd", "pam", "python", "polkit",
+    "qt6-wayland", "layer-shell-qt>=6.6", "systemd", "pam", "python", "polkit", "wl-clipboard",
 )
 PACMAN = "/usr/bin/pacman"
 PACMAN_CONF = "/usr/bin/pacman-conf"

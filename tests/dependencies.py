@@ -138,6 +138,36 @@ class DependencyTests(unittest.TestCase):
                          ["extra/qt6-wayland", "omarchy/layer-shell-qt"])
         self.assertIn([dependencies.VERCMP, "6.7.4-2", "6.6"], database.calls)
 
+    def test_missing_clipboard_client_gates_widget_and_uses_original_repository_package(self):
+        for available in (False, True):
+            with self.subTest(available=available):
+                database = PackageDatabase(
+                    ["wl-clipboard"],
+                    {"wl-clipboard": ("extra", "2.2.1-1")} if available else {})
+                status = self.check(database)
+                self.assertEqual(status["state"], "missing")
+                self.assertFalse(status["setup_required"])
+                self.assertEqual(status["installable"], available)
+                self.assertEqual([item["name"] for item in status["missing"]], ["wl-clipboard"])
+                self.assertNotIn([dependencies.PROMPT, "--check-runtime"], database.calls)
+                if available:
+                    self.assertEqual(dependencies.installation_targets(status), ["extra/wl-clipboard"])
+                else:
+                    self.assertEqual(status["missing"][0]["reason"], "repository_unavailable")
+                    with self.assertRaisesRegex(dependencies.DependencyError, "dependencies_not_installable"):
+                        dependencies.installation_targets(status)
+
+    def test_package_and_widget_gate_require_the_same_original_runtime_packages(self):
+        process = subprocess.run(
+            ["/usr/bin/bash", "-c", 'source "$1"; printf "%s\\n" "${depends[@]}"',
+             "keycontroller-dependency-contract", str(ROOT / "packaging/PKGBUILD")],
+            capture_output=True, text=True, timeout=5, check=True)
+        packaged = process.stdout.splitlines()
+        gated = [item for item in dependencies.REQUIREMENTS if item != dependencies.HELPER_REQUIREMENT]
+        self.assertEqual(len(packaged), len(set(packaged)))
+        self.assertEqual(len(dependencies.REQUIREMENTS), len(set(dependencies.REQUIREMENTS)))
+        self.assertEqual(set(packaged), set(gated))
+
     def test_unpublished_helper_does_not_invent_repository_or_download(self):
         database = PackageDatabase([dependencies.HELPER_REQUIREMENT])
         status = self.check(database)
@@ -149,12 +179,14 @@ class DependencyTests(unittest.TestCase):
             dependencies.installation_targets(status)
 
     def test_old_repository_version_is_explicit_and_not_installable(self):
-        database = PackageDatabase([dependencies.HELPER_REQUIREMENT],
-                                   {"keycontroller": ("omarchy", "0.1.0-21")})
-        database.comparison = -1
-        status = self.check(database)
-        self.assertFalse(status["installable"])
-        self.assertEqual(status["missing"][0]["reason"], "repository_version_too_old")
+        for version in ("0.1.0-21", "0.1.3-1"):
+            with self.subTest(version=version):
+                database = PackageDatabase([dependencies.HELPER_REQUIREMENT],
+                                           {"keycontroller": ("omarchy", version)})
+                database.comparison = -1
+                status = self.check(database)
+                self.assertFalse(status["installable"])
+                self.assertEqual(status["missing"][0]["reason"], "repository_version_too_old")
 
     def test_signature_requirement_honors_repository_override(self):
         for policy in ("PackageOptional", "PackageNever", "PackageTrustAll"):
@@ -880,15 +912,15 @@ case "$1" in
             [ -x '{python}' ] && exit 0
             printf 'python\\n'; exit 127
         fi
-        if [ "$2" = 'keycontroller>=0.1.3-1' ]; then
-            {'exit 0' if helper == 'installed' else "printf 'keycontroller>=0.1.3-1\\n'; exit 127"}
+        if [ "$2" = 'keycontroller>=0.1.4-1' ]; then
+            {'exit 0' if helper == 'installed' else "printf 'keycontroller>=0.1.4-1\\n'; exit 127"}
         fi
         exit 2 ;;
     -Si)
         if [ "$2" = python ]; then
             printf 'Repository : extra\\nName : python\\nVersion : 3.14.0-1\\n'
         elif [ "$2" = keycontroller ]; then
-            {'exit 1' if helper == 'absent' else "printf 'Repository : omarchy\\nName : keycontroller\\nVersion : 0.1.3-1\\n'"}
+            {'exit 1' if helper == 'absent' else "printf 'Repository : omarchy\\nName : keycontroller\\nVersion : 0.1.4-1\\n'"}
         else exit 2; fi ;;
     -S)
         [ {outcome} = 0 ] || exit {outcome}

@@ -29,6 +29,16 @@ jobs:
           printf '%s\n' "$base_image" > "$RUNNER_TEMP/keycontroller-base-image.txt"
           docker build --build-arg "BASE_IMAGE=$base_image" -t keycontroller-builder -f .github/ci/Dockerfile .github/ci
           docker image inspect --format '{{.Id}}' keycontroller-builder > "$RUNNER_TEMP/keycontroller-builder-image.txt"
+      - name: Check native clipboard isolation on Qt 6.12 or newer
+        shell: bash
+        run: |
+          set -euo pipefail
+          base_image=$(cat "$RUNNER_TEMP/keycontroller-base-image.txt")
+          docker build --build-arg "BASE_IMAGE=$base_image" -t keycontroller-clipboard-current -f .github/ci/Dockerfile.qt-current .github/ci
+          docker run --rm --cap-drop=ALL --security-opt=no-new-privileges --network=none \
+            --mount "type=bind,src=$RUNNER_TEMP/keycontroller-source.tar,dst=/source.tar,readonly" \
+            --mount "type=bind,src=$PWD/.github/ci/check-clipboard,dst=/check-clipboard,readonly" \
+            keycontroller-clipboard-current /bin/bash /check-clipboard
       - name: Build and test twice in separate clean containers
         env:
           SOURCE_DATE_EPOCH: ${{ steps.inputs.outputs.epoch }}

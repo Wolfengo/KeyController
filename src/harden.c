@@ -1,12 +1,15 @@
 #define _GNU_SOURCE
 #include <fcntl.h>
 #include <errno.h>
+#include <poll.h>
+#include <signal.h>
 #include <stdarg.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/prctl.h>
 #include <sys/resource.h>
 #include <sys/socket.h>
+#include <time.h>
 #include <unistd.h>
 
 // exec resets PR_SET_DUMPABLE. Apply it before the external program's main,
@@ -16,9 +19,18 @@ __attribute__((constructor)) static void ssh_keys_harden(void) {
     if (setrlimit(RLIMIT_CORE, &limit) || prctl(PR_SET_DUMPABLE, 0) ||
         prctl(PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0))
         _exit(125);
-    if (!getenv("SSH_KEYS_HARDEN_STAGE")) return;
+    const char *clipboard_flag = getenv("SSH_KEYS_INTERNAL_CLIPBOARD");
+    int clipboard = clipboard_flag && !strcmp(clipboard_flag, "1");
+    // A clipboard child may obtain its Wayland descriptor only after this
+    // constructor confirms protection. A later unexpected exec inherits the
+    // mode but not the startup stage, and must stop before its main function.
+    if (!getenv("SSH_KEYS_HARDEN_STAGE")) {
+        if (clipboard) _exit(125);
+        return;
+    }
     unsetenv("SSH_KEYS_HARDEN_STAGE");
-    if (write(30, "R", 1) != 1) _exit(125);
+    const char ready = clipboard ? 'C' : 'R';
+    if (write(30, &ready, 1) != 1) _exit(125);
     int destinations[8], descriptors[8];
     _Alignas(struct cmsghdr) char control[CMSG_SPACE(sizeof descriptors)];
     struct iovec io = {.iov_base = destinations, .iov_len = sizeof destinations};
@@ -87,7 +99,102 @@ static void internal_askpass(void) {
     _exit(failed ? 125 : 0);
 }
 
+// wl-paste ordinarily execs cat after placing the clipboard stream on stdin.
+// Another exec would make that descriptor accessible before a constructor can
+// restore nondumpability. In our explicit clipboard mode, relay in the already
+// protected fork instead. This is our bounded transport, not a copy of cat.
+static int clipboard_wait(int fd, short events, const struct timespec *deadline) {
+    for (;;) {
+        struct timespec now;
+        if (clock_gettime(CLOCK_MONOTONIC, &now)) return -1;
+        time_t seconds = deadline->tv_sec - now.tv_sec;
+        long nanoseconds = deadline->tv_nsec - now.tv_nsec;
+        if (nanoseconds < 0) {
+            --seconds;
+            nanoseconds += 1000000000L;
+        }
+        if (seconds < 0 || (seconds == 0 && nanoseconds == 0)) return -1;
+        // The deadline is at most two seconds away. Round upwards so a short
+        // final interval does not become a zero-timeout busy loop.
+        int milliseconds = (int)(seconds * 1000 + (nanoseconds + 999999L) / 1000000L);
+        struct pollfd descriptor = {.fd = fd, .events = events};
+        int result = poll(&descriptor, 1, milliseconds);
+        if (result < 0 && errno == EINTR) continue;
+        if (result <= 0 || descriptor.revents & (POLLERR | POLLNVAL)) return -1;
+        if (clock_gettime(CLOCK_MONOTONIC, &now) || now.tv_sec > deadline->tv_sec ||
+            (now.tv_sec == deadline->tv_sec && now.tv_nsec >= deadline->tv_nsec))
+            return -1;
+        if (descriptor.revents & events) return 0;
+        if ((events & POLLIN) && descriptor.revents & POLLHUP) return 0;
+        if (descriptor.revents & POLLHUP) return -1;
+    }
+}
+
+static void internal_clipboard_copy(void) __attribute__((noreturn));
+static void internal_clipboard_copy(void) {
+    unsigned char bytes[16385];
+    size_t length = 0, sent = 0;
+    int failed = 1;
+    struct timespec deadline;
+    if (prctl(PR_GET_DUMPABLE) != 0 || clock_gettime(CLOCK_MONOTONIC, &deadline))
+        goto finished;
+    deadline.tv_sec += 2;
+    int input_flags = fcntl(STDIN_FILENO, F_GETFL);
+    int output_flags = fcntl(STDOUT_FILENO, F_GETFL);
+    int status_flags = fcntl(4, F_GETFL);
+    struct sigaction ignore_pipe = {.sa_handler = SIG_IGN};
+    if (sigemptyset(&ignore_pipe.sa_mask) || sigaction(SIGPIPE, &ignore_pipe, NULL) ||
+        input_flags < 0 || output_flags < 0 || status_flags < 0 ||
+        fcntl(STDIN_FILENO, F_SETFL, input_flags | O_NONBLOCK) < 0 ||
+        fcntl(STDOUT_FILENO, F_SETFL, output_flags | O_NONBLOCK) < 0 ||
+        fcntl(4, F_SETFL, status_flags | O_NONBLOCK) < 0)
+        goto finished;
+    // Buffer at most the complete permitted selection plus one overflow byte.
+    // wl-paste ignores cat's exit status, so streaming a prefix before checking
+    // the limit could otherwise present a truncated selection as success.
+    for (;;) {
+        if (clipboard_wait(STDIN_FILENO, POLLIN, &deadline)) goto finished;
+        ssize_t count = read(STDIN_FILENO, bytes + length, sizeof bytes - length);
+        if (count < 0 && (errno == EINTR || errno == EAGAIN || errno == EWOULDBLOCK))
+            continue;
+        if (count < 0) goto finished;
+        if (!count) break;
+        length += (size_t)count;
+        if (length == sizeof bytes) goto finished;
+    }
+    while (sent < length) {
+        if (clipboard_wait(STDOUT_FILENO, POLLOUT, &deadline)) goto finished;
+        ssize_t count = write(STDOUT_FILENO, bytes + sent, length - sent);
+        if (count < 0 && (errno == EINTR || errno == EAGAIN || errno == EWOULDBLOCK))
+            continue;
+        if (count <= 0) goto finished;
+        sent += (size_t)count;
+    }
+    failed = 0;
+finished:
+    explicit_bzero(bytes, sizeof bytes);
+    // The unmodified wl-paste does not propagate its cat child's exit status.
+    // Report completion on a separately granted descriptor, after all bytes
+    // were copied and cleared. The caller requires exactly this one marker,
+    // EOF and wl-paste's clean exit before accepting any clipboard result.
+    if (!failed) {
+        if (clipboard_wait(4, POLLOUT, &deadline) || write(4, "S", 1) != 1)
+            failed = 1;
+    }
+    _exit(failed ? 125 : 0);
+}
+
 int execlp(const char *file, const char *arg, ...) {
+    const char *clipboard = getenv("SSH_KEYS_INTERNAL_CLIPBOARD");
+    if (clipboard && !strcmp(clipboard, "1")) {
+        if (strcmp(file, "cat") || strcmp(arg, "cat")) _exit(125);
+        va_list clipboard_args;
+        va_start(clipboard_args, arg);
+        const char *extra = va_arg(clipboard_args, const char *);
+        va_end(clipboard_args);
+        if (extra) _exit(125);
+        internal_clipboard_copy();
+    }
     const char *internal = getenv("SSH_KEYS_INTERNAL_ASKPASS");
     const char *askpass = getenv("SSH_ASKPASS");
     if (internal && !strcmp(internal, "1") && askpass && !strcmp(file, askpass))

@@ -12,8 +12,9 @@ class WidgetLocalizationTests(unittest.TestCase):
         module = (ROOT / 'plugin/KeyLocale.js').read_text()
         english = json.loads(module.split('var english = ', 1)[1].split('\n\nfunction text', 1)[0])
         sources = set()
-        for name in ('Panel.qml', 'KeyDuration.qml', 'KeyDependencies.qml'):
-            source = (ROOT / 'plugin' / name).read_text()
+        for path in sorted((ROOT / 'plugin').glob('*.qml')):
+            name = path.name
+            source = path.read_text()
             for match in re.finditer(r'"(?:[^"\\]|\\.)*"', source):
                 value = json.loads(match.group())
                 if not re.search('[А-Яа-яЁё]', value):

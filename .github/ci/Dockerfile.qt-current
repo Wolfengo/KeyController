@@ -1,0 +1,12 @@
+# Use the same digest-pinned official Arch base selected by the workflow.
+ARG BASE_IMAGE
+FROM ${BASE_IMAGE}
+# This test environment follows current Arch, including the affected Qt path.
+# Upgrade the whole disposable image; never mix current Qt with stable libraries.
+RUN pacman -Syu --noconfirm --needed \
+    qt6-base qt6-declarative python pkgconf gcc wayland wl-clipboard && \
+    pacman -Dk && \
+    useradd --uid 1000 --create-home builder && \
+    install -d -o builder -g builder /build
+USER builder
+WORKDIR /build

@@ -35,11 +35,12 @@ Panel {
   onActiveRequestChanged: if (!activeRequest) activeRequestKey = ""
   property string message: ""
   property bool showCandidates: false
-  property alias searchQuery: searchInput.text
+  readonly property var searchInput: searchLoader.item
+  readonly property string searchQuery: searchInput ? searchInput.text : ""
   readonly property string searchNeedle: searchQuery.toLowerCase()
   onSearchQueryChanged: Qt.callLater(resetListScroll)
   onShowCandidatesChanged: {
-    searchInput.clear()
+    if (searchInput) searchInput.clear()
     Qt.callLater(resetListScroll)
     if (opened && !settingsOpen) Qt.callLater(focusSearch)
   }
@@ -82,7 +83,7 @@ Panel {
     if (scroll.contentItem && scroll.contentItem.contentY !== undefined) scroll.contentItem.contentY = 0
   }
   function focusSearch() {
-    if (opened && searchInput.visible) searchInput.forceActiveFocus()
+    if (opened && searchInput && searchInput.visible) searchInput.forceActiveFocus()
   }
 
   function isPoll(action) { return action === "panel.list" || action === "requests.status" }
@@ -311,7 +312,13 @@ Panel {
       clockSeconds = Math.floor(Date.now() / 1000)
       if (activeRequest) call("requests.status", null, null, activeRequest)
       else refresh()
-    } else searchInput.clear()
+    } else clipboardPaste.cancel()
+  }
+
+  onSearchInputChanged: if (!searchInput) clipboardPaste.cancel()
+  ClipboardPaste {
+    id: clipboardPaste
+    onFailed: root.message = root.t("Не удалось вставить текст. Введите запрос вручную")
   }
 
   Process {
@@ -452,7 +459,7 @@ Panel {
     padding: Style.space(20)
     contentWidth: popup.fittedContentWidth(Style.space(400))
     contentHeight: popup.fittedContentHeight(content.implicitHeight, Style.space(680))
-    focusTarget: searchInput.visible ? searchInput : content
+    focusTarget: searchInput && searchInput.visible ? searchInput : content
     ColumnLayout {
       id: content
       anchors.fill: parent
@@ -463,7 +470,7 @@ Panel {
         else root.close()
       }
       Keys.onPressed: function(event) {
-        if (event.key === Qt.Key_F && event.modifiers === Qt.ControlModifier && searchInput.visible) {
+        if (event.key === Qt.Key_F && event.modifiers === Qt.ControlModifier && searchInput && searchInput.visible) {
           root.focusSearch()
           searchInput.selectAll()
           event.accepted = true
@@ -544,24 +551,29 @@ Panel {
       }
 
       RowLayout {
+        id: searchRow
         visible: root.dependenciesReady && root.inventoryReady && !root.needsInitialScan && !root.settingsOpen
         Layout.fillWidth: true
         spacing: Style.space(4)
-        TextField {
-          id: searchInput
-          objectName: "ssh-keys-search"
+        Loader {
+          id: searchLoader
+          active: root.opened && searchRow.visible
           Layout.fillWidth: true
-          implicitHeight: Style.space(32)
-          placeholderText: root.t("Поиск по имени, пути или отпечатку")
-          Accessible.name: placeholderText
-          foreground: Color.popups.text
-          font.pixelSize: Style.font.bodySmall
-          selectByMouse: true
-          maximumLength: 4096
-          onVisibleChanged: if (visible) Qt.callLater(root.focusSearch)
-          Keys.onEscapePressed: function(event) {
-            if (text !== "") clear()
-            else event.accepted = false
+          Layout.preferredHeight: item ? item.implicitHeight : Style.space(32)
+          onLoaded: Qt.callLater(root.focusSearch)
+          sourceComponent: SearchInput {
+            objectName: "ssh-keys-search"
+            implicitHeight: Style.space(32)
+            placeholderText: root.t("Поиск по имени, пути или отпечатку")
+            Accessible.name: placeholderText
+            foreground: Color.popups.text
+            font.pixelSize: Style.font.bodySmall
+            onPasteRequested: clipboardPaste.start(root.searchInput)
+            onActiveFocusChanged: if (!activeFocus) clipboardPaste.cancel()
+            Keys.onEscapePressed: function(event) {
+              if (text !== "") clear()
+              else event.accepted = false
+            }
           }
         }
         KeyAction {
@@ -572,7 +584,7 @@ Panel {
           bordered: false
           iconText: "\uf00d"
           tooltipText: root.t("Очистить поиск")
-          onClicked: { searchInput.clear(); root.focusSearch() }
+          onClicked: { if (searchInput) searchInput.clear(); root.focusSearch() }
         }
       }
 
