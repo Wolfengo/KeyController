@@ -134,6 +134,7 @@ var english = {
   "Сведения и настройки": "Details and settings",
   "Ключи не найдены": "No keys found",
   "Поиск по имени, пути или отпечатку": "Search name, path or fingerprint",
+  "Не удалось вставить текст. Введите запрос вручную": "Could not paste text. Type your search instead",
   "Очистить поиск": "Clear search",
   "Нет совпадений": "No matches",
   "Добавьте ключ через +": "Add a key with +",

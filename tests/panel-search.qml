@@ -72,6 +72,7 @@ ShellRoot {
       test.scroll = test.find(panel, "ssh-keys-scroll")
       test.clearButton = test.find(panel, "ssh-keys-search-clear")
       test.check(test.search && test.repeater && test.scroll && test.clearButton, "controls missing")
+      test.check(test.search.readOnly, "native clipboard-reading editor is enabled")
       keyboard.parent = test.search
       test.waitFor(function() { return test.search.activeFocus }, "popup did not focus search")
       test.check(test.repeater.count === 4, "main list dedup/encrypted scope changed")
@@ -90,6 +91,13 @@ ShellRoot {
       keyboard.keyClick(Qt.Key_H)
       test.check(test.repeater.count === 1 && test.repeater.itemAt(0) === alpha, "fourth character did not narrow")
       test.check(test.search.activeFocus, "typing lost focus")
+      keyboard.keyClick(Qt.Key_Backspace)
+      test.check(test.search.text === "alp", "backspace")
+      keyboard.keyClick(Qt.Key_Z, Qt.ControlModifier)
+      test.check(test.search.text === "alph", "bounded undo")
+      keyboard.keyClick(Qt.Key_Z, Qt.ControlModifier | Qt.ShiftModifier)
+      test.check(test.search.text === "alp", "bounded redo")
+      keyboard.keyClick(Qt.Key_H)
 
       // An identical poll and an access-state change preserve both text and
       // row identity, including the edit cursor/selection.
@@ -162,8 +170,11 @@ ShellRoot {
       test.replaceText("anything")
       test.check(!panel.searchHasNoResults && empty.text === "No keys found", "empty inventory conflated with no matches")
       panel.close()
-      test.check(test.search.text === "", "close retained stale filter")
+      test.check(panel.searchInput === null && panel.searchQuery === "", "closed panel retained its search editor")
       panel.open()
+      test.search = test.find(panel, "ssh-keys-search")
+      test.check(test.search && test.search.readOnly && test.search.text === "", "reopened editor is not safe/empty")
+      keyboard.parent = test.search
       test.waitFor(function() { return test.search.activeFocus }, "reopened popup did not focus input")
       test.check(test.calls === 0, "local filtering dispatched API calls")
       panel.close()

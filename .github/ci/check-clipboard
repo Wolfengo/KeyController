@@ -1,0 +1,42 @@
+#!/bin/bash
+# Isolated synthetic tests only. The workflow disables container networking and
+# mounts the source archive read-only; no desktop sockets are passed through.
+set -euo pipefail
+[[ $(id -u) != 0 ]]
+[[ -f /source.tar ]]
+unset WAYLAND_DISPLAY WAYLAND_SOCKET DISPLAY DBUS_SESSION_BUS_ADDRESS
+
+qt_version=$(pkg-config --modversion Qt6Core)
+if (( $(vercmp "$qt_version" '6.12.0') < 0 )); then
+  printf 'Clipboard regression requires Qt >= 6.12.0; found %s\n' "$qt_version" >&2
+  exit 1
+fi
+printf 'Current-Qt clipboard test package versions:\n'
+LC_ALL=C pacman -Q qt6-base qt6-declarative python pkgconf gcc
+qt_modules=(Qt6Quick Qt6Qml Qt6QuickControls2 Qt6Test)
+for module in Qt6Core "${qt_modules[@]}"; do
+  module_version=$(pkg-config --modversion "$module")
+  printf '%s %s\n' "$module" "$module_version"
+done
+
+clipboard_build=$(mktemp -d /build/keycontroller-qt-current.XXXXXX)
+trap 'rm -rf -- "$clipboard_build"' EXIT
+mkdir "$clipboard_build/source" "$clipboard_build/build"
+tar --extract --file=/source.tar --directory="$clipboard_build/source" --no-same-owner
+cd "$clipboard_build/source"
+
+# Compile only the Qt Quick regression; the system helper and authentication
+# window are built separately against Omarchy stable by the distribution job.
+qt_cflags=$(pkg-config --cflags "${qt_modules[@]}")
+qt_ldflags=$(pkg-config --libs "${qt_modules[@]}")
+read -r -a qt_flags <<< "$qt_cflags"
+read -r -a qt_libs <<< "$qt_ldflags"
+qt_moc="$(pkg-config --variable=libexecdir Qt6Core)/moc"
+[[ -x $qt_moc ]]
+"$qt_moc" "${qt_flags[@]}" tests/search-clipboard.cpp \
+  -o "$clipboard_build/build/search-clipboard.moc"
+g++ -std=c++20 -Wall -Wextra -Wpedantic -UNDEBUG -fPIC \
+  "${qt_flags[@]}" -I "$clipboard_build/build" tests/search-clipboard.cpp \
+  -o "$clipboard_build/build/search-clipboard-test" "${qt_libs[@]}"
+python tests/search-clipboard.py "$clipboard_build/build/search-clipboard-test"
+python tests/clipboard.py
