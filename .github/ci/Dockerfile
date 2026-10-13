@@ -7,7 +7,7 @@ FROM ${BASE_IMAGE}
 RUN printf 'Server = https://stable-mirror.omarchy.org/$repo/os/$arch\n' > /etc/pacman.d/mirrorlist && \
     pacman -Syyuu --noconfirm --needed \
     git rust cmake ninja openssh qt6-base qt6-svg qt6-wayland qt6-declarative layer-shell-qt \
-    systemd pam python polkit wl-clipboard at-spi2-core dbus glib2 pkgconf && \
+    systemd pam python polkit wl-clipboard wayland at-spi2-core dbus glib2 pkgconf && \
     pacman -Dk && \
     useradd --uid 1000 --create-home builder && \
     install -d -o builder -g builder /build

@@ -11,7 +11,7 @@ depends=('openssh>=10.5p1' 'qt6-base' 'qt6-svg' 'qt6-wayland' 'layer-shell-qt>=6
 provides=("ssh-keys=$pkgver-$pkgrel")
 conflicts=('ssh-keys')
 replaces=('ssh-keys')
-makedepends=('rust' 'cmake' 'ninja' 'qt6-wayland' 'qt6-declarative' 'at-spi2-core' 'dbus' 'glib2' 'pkgconf')
+makedepends=('rust' 'cmake' 'ninja' 'qt6-wayland' 'qt6-declarative' 'wayland' 'at-spi2-core' 'dbus' 'glib2' 'pkgconf')
 optdepends=('fprintd: biometric binding and unlocking' 'omarchy: bar widget')
 source=("$url/releases/download/v$pkgver/keycontroller-$pkgver.tar.gz")
 # scripts/package-source replaces this with the actual release digest.
@@ -55,6 +55,7 @@ check() {
   python tests/widget-localization.py
   python tests/dependencies.py
   python tests/clipboard.py
+  python tests/clipboard-wayland.py
   python tests/package-brand.py
   python tests/package-export.py
   python tests/package-qt-dependencies.py

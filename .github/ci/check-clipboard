@@ -12,7 +12,7 @@ if (( $(vercmp "$qt_version" '6.12.0') < 0 )); then
   exit 1
 fi
 printf 'Current-Qt clipboard test package versions:\n'
-LC_ALL=C pacman -Q qt6-base qt6-declarative python pkgconf gcc
+LC_ALL=C pacman -Q qt6-base qt6-declarative python pkgconf gcc wayland wl-clipboard
 qt_modules=(Qt6Quick Qt6Qml Qt6QuickControls2 Qt6Test)
 for module in Qt6Core "${qt_modules[@]}"; do
   module_version=$(pkg-config --modversion "$module")
@@ -40,3 +40,4 @@ g++ -std=c++20 -Wall -Wextra -Wpedantic -UNDEBUG -fPIC \
   -o "$clipboard_build/build/search-clipboard-test" "${qt_libs[@]}"
 python tests/search-clipboard.py "$clipboard_build/build/search-clipboard-test"
 python tests/clipboard.py
+python tests/clipboard-wayland.py
