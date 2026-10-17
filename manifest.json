@@ -1,11 +1,11 @@
 {
   "schemaVersion": 1,
   "id": "org.omarchy.keycontroller",
-  "name": "KeyController",
-  "version": "0.4.1",
+  "name": "KeyController — SSH Key Manager",
+  "version": "0.4.2",
   "author": "KeyController contributors",
   "license": "MIT AND Apache-2.0",
-  "description": "Let AI agents, apps and deployment scripts ask for SSH access, then unlock with your fingerprint or key passphrase. Manage existing keys from the Omarchy bar with live search, per-key countdowns, one-click revocation and optional revoke-before-sleep. Works with the standard OpenSSH agent for SSH and Git, and follows your Omarchy theme.",
+  "description": "SSH key manager for Omarchy with biometric fingerprint unlock or key passwords (passphrases). Let AI agents such as Codex and Claude Code, apps and deployment scripts request access through kctrl. Manage existing SSH keys with per-key timers, instant revocation and optional revoke-before-sleep. Works with the standard OpenSSH agent for SSH and Git.",
   "repository": "https://github.com/Wolfengo/KeyController",
   "kinds": [
     "bar-widget"
