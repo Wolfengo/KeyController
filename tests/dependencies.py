@@ -804,6 +804,30 @@ class ShellBootstrapTests(unittest.TestCase):
         launcher.write_text(source)
         return launcher
 
+    def test_missing_python_preview_never_bootstraps_or_creates_lock(self):
+        with tempfile.TemporaryDirectory() as directory:
+            directory = Path(directory)
+            launcher = self.fixture(directory)
+            sentinel = directory / "mutated"
+            forbidden = directory / "forbidden"
+            forbidden.write_text(f"#!/bin/sh\ntouch '{sentinel}'\nexit 1\n")
+            forbidden.chmod(0o700)
+            source = launcher.read_text()
+            source = source.replace("SUDO=/usr/bin/sudo", "SUDO=" + str(forbidden))
+            source = source.replace("FLOCK=/usr/bin/flock", "FLOCK=" + str(forbidden))
+            source = source.replace("runtime=/run/user/$uid", "runtime=" + str(directory))
+            launcher.write_text(source)
+            process = subprocess.run(["/bin/sh", str(launcher), "--dry-run", "--json"],
+                                     capture_output=True, text=True, timeout=10)
+            plan = json.loads(process.stdout)
+            self.assertEqual(process.returncode, 1)
+            self.assertEqual(plan["mode"], "dry-run")
+            self.assertFalse(plan["complete"])
+            self.assertFalse(plan["ready"])
+            self.assertFalse(sentinel.exists())
+            self.assertFalse((directory / "keycontroller-dependencies.lock").exists())
+            self.assertIn("python_required", [item["code"] for item in plan["warnings"]])
+
     def test_missing_python_reports_only_bootstrap_package_and_incomplete_list(self):
         with tempfile.TemporaryDirectory() as directory:
             launcher = self.fixture(directory)
@@ -1083,6 +1107,142 @@ esac
                 self.assertEqual(self.run_wizard(launcher), 1)
             self.assertNotIn("sudo", events.read_text().splitlines())
             self.assertFalse(argv.exists())
+
+
+class PreviewTests(unittest.TestCase):
+    setUp = DependencyTests.setUp
+
+    @staticmethod
+    def setup_plan(ready=True):
+        return {"schema_version": 1, "mode": "dry-run", "ready": ready,
+                "operations": [{"kind": "file", "action": "create", "path": "/example/config"}],
+                "blockers": [] if ready else [{"code": "configuration_conflict"}], "warnings": []}
+
+    def test_configured_wizard_previews_only_skill_links_without_lock_or_mutations(self):
+        with patch.object(dependencies, "query", side_effect=PackageDatabase()), \
+                patch.object(dependencies, "installed_setup_preview", return_value=self.setup_plan()) as preview, \
+                patch.object(dependencies, "installation_lock", side_effect=AssertionError("lock")), \
+                patch.object(dependencies.subprocess, "run", side_effect=AssertionError("mutation")):
+            plan = dependencies.wizard_preview()
+        self.assertTrue(plan["ready"])
+        self.assertTrue(plan["complete"])
+        preview.assert_called_once_with("agent-skills")
+
+    def test_initial_setup_also_previews_final_skill_requirement(self):
+        with patch.object(dependencies, "query", side_effect=PackageDatabase()), \
+                patch.object(dependencies, "setup_receipt_complete", return_value=False), \
+                patch.object(dependencies, "installed_setup_preview",
+                             side_effect=[self.setup_plan(), self.setup_plan(False)]) as preview:
+            plan = dependencies.wizard_preview()
+        self.assertEqual([call.args[0] for call in preview.call_args_list], ["apply", "agent-skills"])
+        self.assertFalse(plan["ready"])
+        self.assertIn({"code": "configuration_conflict"}, plan["blockers"])
+
+    def test_missing_packages_print_exact_targets_but_defer_post_install_configuration(self):
+        database = PackageDatabase(["qt6-svg"], {"qt6-svg": ("extra", "6.11.2-1")})
+        with patch.object(dependencies, "query", side_effect=database), \
+                patch.object(dependencies.subprocess, "run", side_effect=AssertionError("mutation")), \
+                patch.object(dependencies, "installation_lock", side_effect=AssertionError("lock")), \
+                patch.object(dependencies, "installed_setup_preview") as preview:
+            plan = dependencies.wizard_preview()
+        self.assertFalse(plan["ready"])
+        self.assertFalse(plan["complete"])
+        self.assertEqual(plan["operations"][0]["command"],
+                         [dependencies.SUDO, dependencies.PACMAN, "-S", "--needed", "--", "extra/qt6-svg"])
+        self.assertEqual(plan["setup"]["state"], "deferred")
+        preview.assert_not_called()
+        self.assertTrue(all(command[0] != dependencies.SUDO for command in database.calls))
+
+    def test_unavailable_repository_never_invents_install_command(self):
+        with patch.object(dependencies, "query", side_effect=PackageDatabase([dependencies.HELPER_REQUIREMENT])), \
+                patch.object(dependencies, "installed_setup_preview") as preview:
+            plan = dependencies.wizard_preview()
+        self.assertFalse(plan["ready"])
+        self.assertEqual(plan["blockers"], [{"code": "dependencies_not_installable"}])
+        self.assertFalse(any("command" in item for item in plan["operations"]))
+        preview.assert_not_called()
+
+    def test_legacy_migration_is_explicitly_incomplete_not_an_apply_preview(self):
+        with patch.object(dependencies, "query", side_effect=PackageDatabase()), \
+                patch.object(dependencies, "legacy_widget_state", return_value="managed"), \
+                patch.object(dependencies, "installed_setup_preview") as preview:
+            plan = dependencies.wizard_preview()
+        self.assertFalse(plan["complete"])
+        self.assertFalse(plan["ready"])
+        self.assertEqual(plan["operations"][0]["command"], [dependencies.SETUP, "--migrate-brand"])
+        preview.assert_not_called()
+
+    def test_old_installed_setup_is_reported_without_fallback_execution(self):
+        with patch.object(dependencies, "query", side_effect=PackageDatabase()), \
+                patch.object(dependencies, "installed_setup_preview",
+                             side_effect=dependencies.DependencyError("setup_preview_unavailable")):
+            plan = dependencies.wizard_preview()
+        self.assertFalse(plan["complete"])
+        self.assertEqual(plan["setup"]["state"], "unavailable")
+        self.assertEqual(plan["blockers"], [{"code": "setup_preview_unavailable"}])
+
+    def test_preview_refuses_root_before_running_package_or_setup_commands(self):
+        with patch.object(dependencies.os, "geteuid", return_value=0), \
+                patch.object(dependencies, "query", side_effect=AssertionError("query")), \
+                patch.object(dependencies, "installed_setup_preview") as preview:
+            plan = dependencies.wizard_preview()
+        self.assertEqual(plan["blockers"], [{"code": "root_not_allowed"}])
+        preview.assert_not_called()
+
+    def test_installed_preview_is_fixed_unprivileged_command_without_stdin(self):
+        info = SimpleNamespace(st_mode=dependencies.stat.S_IFREG | 0o755, st_uid=0)
+        payload = self.setup_plan()
+        with patch.object(Path, "lstat", return_value=info), \
+                patch.object(dependencies.subprocess, "run", return_value=result(stdout=json.dumps(payload))) as run:
+            self.assertEqual(dependencies.installed_setup_preview("apply"), payload)
+        command, = run.call_args.args
+        self.assertEqual(command, [dependencies.SETUP, "--dry-run", "--json", "--scope", "apply"])
+        self.assertEqual(run.call_args.kwargs["stdin"], subprocess.DEVNULL)
+        self.assertEqual(run.call_args.kwargs["timeout"], 30)
+        self.assertTrue(run.call_args.kwargs["close_fds"])
+        self.assertNotIn("shell", run.call_args.kwargs)
+
+    def test_preview_rejects_untrusted_installed_script_and_malformed_reply(self):
+        for mode, uid in [(dependencies.stat.S_IFLNK | 0o777, 0),
+                          (dependencies.stat.S_IFREG | 0o777, 0),
+                          (dependencies.stat.S_IFREG | 0o755, 1000)]:
+            with self.subTest(mode=mode, uid=uid), \
+                    patch.object(Path, "lstat", return_value=SimpleNamespace(st_mode=mode, st_uid=uid)), \
+                    patch.object(dependencies.subprocess, "run") as run:
+                with self.assertRaisesRegex(dependencies.DependencyError, "setup_preview_unavailable"):
+                    dependencies.installed_setup_preview("apply")
+                run.assert_not_called()
+        info = SimpleNamespace(st_mode=dependencies.stat.S_IFREG | 0o755, st_uid=0)
+        for process in [result(2, stderr="private-test-data"), result(stdout="private-test-data"),
+                        result(stdout=json.dumps(dict(self.setup_plan(), schema_version=True))),
+                        result(stdout=json.dumps(dict(self.setup_plan(), ready=False))),
+                        result(stdout=json.dumps(dict(self.setup_plan(), blockers=[{"code": "bad"}])))]:
+            with self.subTest(process=process), patch.object(Path, "lstat", return_value=info), \
+                    patch.object(dependencies.subprocess, "run", return_value=process):
+                with self.assertRaises(dependencies.DependencyError) as error:
+                    dependencies.installed_setup_preview("apply")
+                self.assertNotIn("private-test-data", str(error.exception))
+
+    def test_cli_preview_needs_no_terminal_and_keeps_json_and_failures_distinct(self):
+        with patch.object(dependencies, "query", side_effect=PackageDatabase()), \
+                patch.object(dependencies, "installed_setup_preview", return_value=self.setup_plan()), \
+                patch.object(dependencies.sys, "stdin", io.StringIO()), \
+                contextlib.redirect_stdout(io.StringIO()) as output:
+            self.assertEqual(dependencies.main(["--dry-run", "--json"]), 0)
+        self.assertTrue(json.loads(output.getvalue())["ready"])
+        for arguments in [["--dry-run", "--install"], ["--dry-run", "--wizard"],
+                          ["--dry-run", "--setup"], ["--dry-run", "--check"]]:
+            with self.subTest(arguments=arguments), contextlib.redirect_stderr(io.StringIO()):
+                with self.assertRaises(SystemExit):
+                    dependencies.main(arguments)
+
+    def test_human_preview_escapes_terminal_controls(self):
+        plan = {"ready": True, "packages": {}, "setup": None, "warnings": [], "blockers": [],
+                "operations": [{"action": "create", "path": "/tmp/a\x1b[31mb"}]}
+        with contextlib.redirect_stdout(io.StringIO()) as output:
+            dependencies.report_preview(plan)
+        self.assertNotIn("\x1b", output.getvalue())
+        self.assertIn("\\u001b", output.getvalue())
 
 
 if __name__ == "__main__":

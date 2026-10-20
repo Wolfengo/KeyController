@@ -7,17 +7,36 @@ import subprocess
 import sys
 
 
+def desktop_uid(value):
+    try:
+        uid = int(value)
+    except (ValueError, TypeError):
+        raise SystemExit('A local non-root desktop UID is required') from None
+    if not 1000 <= uid < 4294967295 or str(uid) != value:
+        raise SystemExit('A local non-root desktop UID is required')
+    return uid
+
+
 def main():
     if os.geteuid() != 0 or len(sys.argv) != 3 or sys.argv[1] != 'enable':
         raise SystemExit('usage: system-setup enable UID (root)')
+    uid = desktop_uid(sys.argv[2])
+    # pkexec supplies the original caller UID after sanitizing its environment.
+    # Administrator authentication grants only activation for that caller.
+    # Polkit checks the caller session; do not substitute XDG_SESSION_ID or
+    # require a session scope here: Omarchy also launches apps in user scopes.
+    # A direct root invocation (including pkexec invoked by root) remains an
+    # explicit administrator operation and may provision another desktop UID.
+    caller = os.environ.get('PKEXEC_UID')
+    if caller not in (None, '0'):
+        if desktop_uid(caller) != uid:
+            raise SystemExit('Setup can only enable the calling desktop user')
     try:
-        uid = int(sys.argv[2])
-    except ValueError:
-        raise SystemExit('A local non-root desktop UID is required') from None
-    if uid < 1000 or str(uid) != sys.argv[2]:
-        raise SystemExit('A local non-root desktop UID is required')
-    user = pwd.getpwuid(uid)
-    if not Path(user.pw_dir).is_dir():
+        user = pwd.getpwuid(uid)
+    except (KeyError, OverflowError):
+        raise SystemExit('Unknown desktop user') from None
+    home = Path(user.pw_dir)
+    if not home.is_absolute() or not home.is_dir():
         raise SystemExit('Missing user home')
     subprocess.run(['/usr/bin/systemd-creds', 'setup'], check=True)
     subprocess.run(['/usr/bin/systemctl', 'daemon-reload'], check=True)

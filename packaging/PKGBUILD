@@ -49,6 +49,7 @@ check() {
   cargo test --locked
   ctest --test-dir build --output-on-failure
   python tests/setup.py
+  python tests/system-setup.py
   python tests/systemd-boot.py
   python tests/sleep.py
   python tests/sleep-systemd.py
@@ -74,6 +75,7 @@ package() {
   install -Dm755 scripts/keycontroller-setup "$pkgdir/usr/bin/keycontroller-setup"
   install -Dm755 scripts/ssh-keys-sleep "$pkgdir/usr/lib/ssh-keys/sleep-coordinator"
   install -Dm755 scripts/ssh-keys-system-setup "$pkgdir/usr/lib/ssh-keys/system-setup"
+  install -Dm644 packaging/org.omarchy.keycontroller.policy "$pkgdir/usr/share/polkit-1/actions/org.omarchy.keycontroller.policy"
   install -Dm644 packaging/ssh-keys-fingerprint "$pkgdir/etc/pam.d/ssh-keys-fingerprint"
   for unit in packaging/*.service packaging/*.socket; do
     install -Dm644 "$unit" "$pkgdir/usr/lib/systemd/system/${unit##*/}"
