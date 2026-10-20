@@ -20,6 +20,16 @@ Automatic package installation supports the standard enabled repositories `core`
 
 The wizard automatically continues from package installation to desktop setup. If Python itself is missing, it installs Python first and continues in the same terminal. Pacman confirms each transaction, and desktop setup can request a separate system authorization. A failure stops the flow and leaves its result visible. Rerunning the wizard rechecks the current state and resumes only the missing steps; packages already installed are retained. Completion is shown only after configuration is verified. The final screen explains when existing applications need a new login to inherit the agent environment.
 
+## Preview installation
+
+From the plugin checkout, run `sh plugin/dependencies --dry-run` to see missing packages, intended setup actions and blockers without installing or changing anything. Add `--json` for structured output. If Python or a compatible installed setup helper is missing, the report marks the desktop preview as incomplete; it does not run setup code from the checkout as root.
+
+When the system package supplies preview support, `keycontroller-setup --dry-run --json` previews normal `--apply` desktop setup. Use `keycontroller-setup --dry-run --scope agent-skills --json` to preview only the packaged AI-instruction links. Preview reads configuration and package metadata without printing configuration contents or discovering SSH keys. It creates no backups, receipt or installation lock, requests no authorization and changes no services or desktop settings. The result is a snapshot; the installer checks the current state again before applying changes, and Pacman confirms the final package transaction.
+
+The dependency preview exits with status 0 only when its plan is complete and prerequisites pass. Status 1 also covers an incomplete preview: missing Python, pending package installation, an older setup helper or a required legacy migration. No installation is attempted to complete a preview. Exact migration changes are not previewed; review migration separately and rerun the preview afterward. On an already configured desktop, the wizard previews only the remaining AI-instruction links and verification.
+
+See the [installation review](installation-review.md) for the operations, privilege boundaries and removal path.
+
 ## Manual package installation and development builds
 
 For testing before repository inclusion, a reviewed package can still be installed manually from [GitHub Releases](https://github.com/Wolfengo/KeyController/releases) or built from source. This is an optional developer path, not the widget's installation workflow.
@@ -46,7 +56,7 @@ Run setup as the desktop user in an unlocked local session. It connects the mana
 
 The public agent socket is `/run/ssh-keys/UID/agent.sock`, and the helper service is `ssh-keysd@UID.service`. These private identifiers are retained for installation compatibility. Setup preserves an existing KeyController checkout and its bar position. Update a Git-installed widget with `omarchy plugin update org.omarchy.keycontroller`; update the privileged helper separately through its package. If no widget exists, setup creates a link to `/usr/share/keycontroller/plugin`, which then receives widget updates through the package manager. Restart the shell with `omarchy restart shell` after QML updates, while the screen is unlocked.
 
-Widget version `0.4.1` requires system package `0.1.4-1` or newer, which supplies the process hardening needed for clipboard access; the local API remains v1. The widget checks its additional `wl-clipboard` dependency separately. Setup records completion only after all configuration steps and the Hyprland reload succeed. If setup was interrupted, use **Set up KeyController** again or rerun `keycontroller-setup --apply`; an enabled service alone does not count as completed setup.
+Widget version `0.4.1` or newer requires system package `0.1.4-1` or newer, which supplies the process hardening needed for clipboard access; the local API remains v1. The widget checks its additional `wl-clipboard` dependency separately. Setup records completion only after all configuration steps and the Hyprland reload succeed. If setup was interrupted, use **Set up KeyController** again or rerun `keycontroller-setup --apply`; an enabled service alone does not count as completed setup.
 
 For Omarchy plugin distribution, the repository's root `manifest.json` points to `plugin/Panel.qml`. The source packaging script also produces a standalone widget archive under `dist/`. The widget checks runtime dependencies and shows **Install and set up** with the missing requirements when needed. If packages are already present, **Set up KeyController** starts the same wizard at the configuration step. Key controls stay unavailable until setup has completed and the wizard has released its installation lock.
 
@@ -121,3 +131,7 @@ ctest --test-dir build --output-on-failure
 ```
 
 The package's `check()` function runs the Rust, Qt and Python regression suites. Read [build integrity and reproducible exports](build-security.md) before preparing release artifacts; local checks do not substitute for the isolated verification workflow or hardware acceptance. `scripts/package-source` creates the source archive, its checksum-pinned PKGBUILD and the standalone widget archive.
+
+### Installation acceptance
+
+The preview and named Polkit action have isolated regression tests, and the policy XML has been checked against the Polkit DTD. Release acceptance also checks real policy loading, action selection, authorization cancellation and rejection of another user's UID with isolated Polkit processes. Active/inactive session fixtures must be identified as synthetic; they do not establish behavior in a real SSH login or a site-specific Polkit configuration. On the target desktop, verify the installed action, its actual administrator prompt, successful own-user activation and a read-only setup preview. Record the tested package, Polkit version and remaining session/hardware coverage with the release evidence.

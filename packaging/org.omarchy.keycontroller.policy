@@ -1,0 +1,20 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE policyconfig PUBLIC "-//freedesktop//DTD polkit Policy Configuration 1.0//EN"
+  "http://www.freedesktop.org/software/polkit/policyconfig-1.dtd">
+<policyconfig>
+  <vendor>KeyController</vendor>
+  <vendor_url>https://github.com/Wolfengo/KeyController</vendor_url>
+  <action id="org.omarchy.keycontroller.setup">
+    <description>Enable KeyController for your desktop account</description>
+    <description xml:lang="ru">Включить KeyController для вашей учётной записи</description>
+    <message>Authentication is required to enable the KeyController service and managed SSH agent for your desktop account.</message>
+    <message xml:lang="ru">Для включения службы KeyController и управляемого SSH-агента для вашей учётной записи нужны права администратора.</message>
+    <defaults>
+      <allow_any>no</allow_any>
+      <allow_inactive>no</allow_inactive>
+      <allow_active>auth_admin</allow_active>
+    </defaults>
+    <annotate key="org.freedesktop.policykit.exec.path">/usr/lib/ssh-keys/system-setup</annotate>
+    <annotate key="org.freedesktop.policykit.exec.argv1">enable</annotate>
+  </action>
+</policyconfig>

@@ -482,22 +482,281 @@ def require_unlocked_session(uid):
         raise RuntimeError('The Omarchy lock is active or pending; unlock it before changing integration')
 
 
+def setup_preconditions(home, socket, configurations):
+    """Shared refusal conditions for planning and applying normal setup."""
+    if not (SHARE / 'plugin/manifest.json').exists():
+        raise RuntimeError('Install the keycontroller system package first')
+    old_widget = home / '.config/omarchy/plugins' / LEGACY_PLUGIN_ID
+    if old_widget.exists() or old_widget.is_symlink():
+        raise RuntimeError('Existing SSH Keys widget retained. Run keycontroller-setup --migrate-brand before --apply')
+    ambiguous = [(p, n + 1) for p, _, es in configurations for n, v, c in es
+                 if v != socket and (c[0] == 'include' or (c == ('host', '*') and not p.is_relative_to(home / '.ssh')))]
+    if ambiguous:
+        raise RuntimeError(f'Conflicting IdentityAgent in shared or external includes requires review before setup: {ambiguous}')
+
+
+def setup_config_plan(home, socket, configurations, shell):
+    """Compute normal setup's writes without publishing configuration contents."""
+    shell = json.loads(json.dumps(shell))
+    if not isinstance(shell, dict):
+        raise RuntimeError('Unexpected Omarchy shell configuration; retained for review')
+    bar = shell.setdefault('bar', {})
+    if not isinstance(bar, dict):
+        raise RuntimeError('Unexpected Omarchy bar configuration; retained for review')
+    layout = bar.setdefault('layout', {})
+    if not isinstance(layout, dict) or any(not isinstance(layout.get(section, []), list)
+                                         or any(not isinstance(entry, dict) for entry in layout.get(section, []))
+                                         for section in ('left', 'center', 'right')):
+        raise RuntimeError('Unexpected Omarchy bar layout; retained for review')
+    if not any(entry.get('id') == PLUGIN_ID for section in ('left', 'center', 'right')
+               for entry in layout.get(section, [])):
+        layout.setdefault('right', []).insert(1, {'id': PLUGIN_ID})
+    disabled = shell.get('disabledPlugins', [])
+    if not isinstance(disabled, list) or any(not isinstance(value, str) for value in disabled):
+        raise RuntimeError('Unexpected disabled plugin list; retained for review')
+    shell['disabledPlugins'] = sorted(set(disabled) - {PLUGIN_ID})
+    writes = [(home / '.config/omarchy/shell.json', json.dumps(shell, ensure_ascii=False, indent=2) + '\n',
+               'Register and enable the widget; preserve the selected lockscreen and its settings')]
+    rewritten, retained = {}, []
+    for path, text, entries in configurations:
+        if not path.is_relative_to(home / '.ssh'):
+            retained.append({'kind': 'file', 'action': 'preserve', 'path': str(path),
+                             'purpose': 'External SSH Include'})
+            continue
+        lines = text.splitlines(keepends=True)
+        changed = False
+        for number, value, context in entries:
+            if value != socket and context == ('host', '*'):
+                lines[number] = f'  IdentityAgent {socket}\n'
+                changed = True
+            elif value != socket:
+                retained.append({'kind': 'configuration', 'action': 'preserve', 'path': str(path),
+                                 'line': number + 1, 'purpose': 'Explicit IdentityAgent exception'})
+        if changed:
+            rewritten[path] = ''.join(lines)
+        elif path != (home / '.ssh/config').resolve():
+            retained.append({'kind': 'file', 'action': 'preserve', 'path': str(path),
+                             'purpose': 'SSH Include with no wildcard agent setting to change'})
+    config = home / '.ssh/config'
+    # Combine the wildcard rewrite and managed block into one final write. This
+    # also keeps the original backup when both affect the primary config.
+    text = rewritten.pop(config, None)
+    if text is None:
+        text = rewritten.get(config.resolve())
+    if text is None:
+        text = config.read_text() if config.exists() else ''
+    for path, text_value in rewritten.items():
+        writes.append((path, text_value, 'Use the managed agent for wildcard IdentityAgent settings'))
+    writes.append((config, managed(text, f'Host *\n  IdentityAgent {socket}'), 'Set the default SSH agent; retain explicit host exceptions'))
+    writes.append((home / '.config/environment.d/90-ssh-keys.conf', f'SSH_AUTH_SOCK={socket}\n',
+                   'Set SSH_AUTH_SOCK for future user sessions'))
+    bashrc = home / '.bashrc'
+    if bashrc.exists():
+        writes.append((bashrc, managed(bashrc.read_text(), f'export SSH_AUTH_SOCK={shlex.quote(socket)}'),
+                       'Set SSH_AUTH_SOCK in interactive Bash sessions'))
+    autostart = home / '.config/hypr/autostart.lua'
+    if autostart.exists():
+        text = autostart.read_text()
+        text = text.replace('hl.env("SSH_AUTH_SOCK", os.getenv("XDG_RUNTIME_DIR") .. "/ssh-agent.socket")', f'hl.env("SSH_AUTH_SOCK", "{socket}")')
+        if f'hl.env("SSH_AUTH_SOCK", "{socket}")' not in text:
+            text += f'\n-- SSH Keys managed agent\nhl.env("SSH_AUTH_SOCK", "{socket}")\n'
+        writes.append((autostart, text, 'Set SSH_AUTH_SOCK in the Hyprland environment'))
+    return writes, retained
+
+
+def setup_file_snapshot(path):
+    if not path.exists() and not path.is_symlink():
+        return None
+    metadata = path.lstat()
+    identity = tuple(getattr(metadata, name) for name in ('st_dev', 'st_ino', 'st_mode', 'st_size', 'st_mtime_ns', 'st_ctime_ns'))
+    return identity, path.read_bytes() if path.exists() else None
+
+
+def _preview_writable(path):
+    """Check existing parents without creating them or testing a write."""
+    parent = path.parent
+    while not parent.exists() and not parent.is_symlink():
+        parent = parent.parent
+    if not parent.is_dir() or not os.access(parent, os.W_OK | os.X_OK):
+        raise RuntimeError(f'Configuration parent is unavailable or not writable: {parent}')
+    if path.exists() and path.is_dir():
+        raise RuntimeError(f'A directory occupies a planned file path: {path}')
+
+
+def preview_agent_skills(home):
+    result = {'schema_version': 1, 'mode': 'dry-run', 'scope': 'agent-skills', 'ready': False,
+              'operations': [], 'blockers': [], 'warnings': []}
+    operations, blockers, warnings = (result[name] for name in ('operations', 'blockers', 'warnings'))
+    try:
+        skills = agent_skills(home)
+    except (OSError, RuntimeError):
+        blockers.append({'code': 'agent_instructions', 'message': 'Installed AI client instruction paths could not be inspected'})
+        return result
+    if not skills['package_available']:
+        blockers.append({'code': 'package_skill_missing', 'message': 'Packaged AI instructions are unavailable'})
+    for entry in skills['clients']:
+        target = Path(entry['path'])
+        can_create = entry['status'] == 'missing'
+        if can_create:
+            try:
+                _preview_writable(target)
+                if target.parent.exists() and target.parent.stat().st_uid != os.getuid():
+                    raise RuntimeError(f'Instruction directory is not owned by this user: {target.parent}')
+            except (OSError, RuntimeError):
+                can_create = False
+                blockers.append({'code': 'skill_destination', 'message': 'Instruction directory is unavailable or not owned by this user: ' + str(target.parent)})
+        operations.append({'kind': 'symlink', 'action': 'create' if can_create else 'preserve',
+                           'path': entry['path'], 'source': skills['source'], 'purpose': 'AI unlock instructions for ' + entry['client']})
+        if entry['status'] in ('conflict', 'unavailable'):
+            blockers.append({'code': 'skill_' + entry['status'], 'message': 'Agent instruction entry retained: ' + entry['path']})
+        if entry.get('legacy_status') == 'migration_available' and (can_create or entry['status'] == 'linked'):
+            operations.append({'kind': 'symlink', 'action': 'remove', 'path': entry['legacy_path'],
+                               'condition': 'Only after the current packaged instruction link exists',
+                               'purpose': 'Remove the exact obsolete package-owned instruction link'})
+        elif entry.get('legacy_status') == 'conflict_retained':
+            warnings.append({'code': 'legacy_skill_conflict', 'message': 'Legacy instruction entry retained: ' + entry['legacy_path']})
+    result['ready'] = not blockers
+    return result
+
+
+def setup_preview(home, uid):
+    """Read-only inventory for --apply; never execute planned commands."""
+    home = Path(home)
+    socket = f'/run/ssh-keys/{uid}/agent.sock'
+    result = {'schema_version': 1, 'mode': 'dry-run', 'scope': 'apply', 'ready': False,
+              'operations': [], 'blockers': [], 'warnings': []}
+    operations, blockers, warnings = (result[name] for name in ('operations', 'blockers', 'warnings'))
+    def inspect(code, function):
+        try:
+            return function()
+        except RuntimeError as error:
+            blockers.append({'code': code, 'message': str(error)})
+        except (OSError, ValueError, UnicodeError, subprocess.SubprocessError):
+            # Exceptions from parsers/processes can contain configuration text.
+            blockers.append({'code': code, 'message': 'Required configuration or local runtime could not be inspected'})
+        return None
+    configurations = inspect('ssh_configuration', lambda: ssh_configs(home))
+    if configurations is not None:
+        inspect('setup_preconditions', lambda: setup_preconditions(home, socket, configurations))
+    else:
+        configurations = []
+    widget = inspect('widget', lambda: preflight_widget_link(home))
+    widget_path = home / '.config/omarchy/plugins' / PLUGIN_ID
+    if widget is not None:
+        operations.append({'kind': 'symlink' if widget != 'directory' else 'directory',
+                           'action': 'create' if widget == 'missing' else 'preserve',
+                           'path': str(widget_path), 'source': str(SHARE / 'plugin'),
+                           'purpose': 'Use the packaged widget or retain the existing updatable checkout'})
+        if widget == 'missing':
+            inspect('widget_destination', lambda: _preview_writable(widget_path))
+    prompt = inspect('capture_protection', lambda: prompt_config_plan(home))
+    backup = home / '.local/state/ssh-keys/setup-<timestamp>-<unique-id>'
+    if prompt is not None:
+        path, _, before, after = prompt
+        operations.append({'kind': 'file', 'action': 'preserve' if before == after else 'update',
+                           'path': str(path), 'source': str(SHARE / 'keycontroller-hyprland.lua'),
+                           'purpose': 'Reference the package capture-protection rule'})
+        if before != after:
+            operations.append({'kind': 'backup', 'action': 'create', 'path': str(backup / '.config/hypr/hyprland.lua'),
+                               'source': str(path), 'mode': '0600'})
+            inspect('capture_destination', lambda: _preview_writable(path))
+    snapshot = inspect('shell_configuration', lambda: _brand_shell_snapshot(home))
+    if snapshot is not None:
+        planned = inspect('configuration_plan', lambda: setup_config_plan(home, socket, configurations, json.loads(snapshot[2])))
+        if planned is not None:
+            writes, retained = planned
+            operations.extend(retained)
+            for path, _, purpose in writes:
+                exists = path.exists() or path.is_symlink()
+                operations.append({'kind': 'file', 'action': 'replace' if exists else 'create',
+                                   'path': str(path), 'mode': '0600', 'purpose': purpose})
+                inspect('configuration_destination', lambda path=path: _preview_writable(path))
+                if exists:
+                    operations.append({'kind': 'backup', 'action': 'create',
+                                       'path': str(backup / path.relative_to(home)), 'source': str(path), 'mode': '0600',
+                                       'purpose': 'Retain the previous configuration inside the private backup directory'})
+                if path.is_symlink():
+                    warnings.append({'code': 'configuration_symlink',
+                                     'message': f'Apply replaces this configuration symlink with a regular file: {path}'})
+    operations.append({'kind': 'directory', 'action': 'create', 'path': str(backup), 'mode': '0700',
+                       'purpose': 'Private backup directory; its final name is chosen when apply starts'})
+    inspect('backup_destination', lambda: _preview_writable(backup))
+    receipt = home / '.local/state/keycontroller/setup.json'
+    operations.append({'kind': 'file', 'action': 'replace' if receipt.exists() else 'create', 'path': str(receipt),
+                       'mode': '0600', 'purpose': 'Record incomplete setup first; mark complete only after configuration and reload succeed'})
+    inspect('receipt_destination', lambda: _preview_writable(receipt))
+    skills = preview_agent_skills(home)
+    operations.extend(skills['operations'])
+    # Normal --apply reports instruction conflicts but completes desktop setup.
+    # The dedicated --install-agent-skills action fails for the same conflicts.
+    warnings.extend(skills['blockers'] + skills['warnings'])
+    inspect('local_session', lambda: require_unlocked_session(uid))
+    operations.extend([
+        {'kind': 'command', 'action': 'authorize', 'command': ['pkexec', '/usr/lib/ssh-keys/system-setup', 'enable', str(uid)],
+         'condition': 'Explicit system authorization; --apply rechecks the unlocked local session afterward'},
+        {'kind': 'command', 'action': 'run-as-root', 'command': ['/usr/bin/systemd-creds', 'setup'],
+         'purpose': 'Initialize the system credential host secret if needed'},
+        {'kind': 'command', 'action': 'run-as-root', 'command': ['/usr/bin/systemctl', 'daemon-reload']},
+        {'kind': 'command', 'action': 'run-as-root', 'command': ['/usr/bin/systemctl', 'enable', '--now', f'ssh-keysd@{uid}.service'],
+         'services': [f'ssh-keysd@{uid}.service', f'ssh-keys-agent@{uid}.socket'],
+         'purpose': 'Enable the helper and its managed-agent socket; the original OpenSSH agent is started on socket demand'},
+        {'kind': 'command', 'action': 'run-as-user', 'command': ['systemctl', '--user', 'set-environment', f'SSH_AUTH_SOCK={socket}']},
+        {'kind': 'command', 'action': 'run-as-user', 'command': ['hyprctl', 'reload']},
+        {'kind': 'command', 'action': 'check', 'command': ['hyprctl', 'configerrors'],
+         'purpose': 'Finish only when the compositor accepts its configuration'},
+    ])
+    warnings.append({'code': 'runtime_revalidation', 'message': 'This is a read-only plan, not an authorization or success guarantee. Apply rechecks the local session and configuration; existing applications may need restarting to inherit SSH_AUTH_SOCK.'})
+    result['ready'] = not blockers
+    return result
+
+
+def report_setup_preview(result, as_json=False):
+    if as_json:
+        print(json.dumps(result, ensure_ascii=False, indent=2))
+        return
+    action = '--install-agent-skills' if result.get('scope') == 'agent-skills' else '--apply'
+    print('KeyController setup preview: ' + ('ready for explicit ' + action if result['ready'] else 'blocked'))
+    print('No files, services, privileges or desktop settings have been changed. Configuration contents and keys are not printed.')
+    print('Planned inventory (files and commands are grouped, not execution order):')
+    for entry in result['operations']:
+        target = shlex.join(entry['command']) if 'command' in entry else entry.get('path', '')
+        print(f'  {entry["action"]}: {json.dumps(target, ensure_ascii=True)}')
+        if entry.get('source'):
+            print('    source: ' + json.dumps(entry['source'], ensure_ascii=True))
+        for field in ('purpose', 'condition'):
+            if entry.get(field):
+                print('    ' + json.dumps(entry[field], ensure_ascii=True))
+    for name in ('blockers', 'warnings'):
+        for entry in result[name]:
+            print(f'{name[:-1].capitalize()} [{entry["code"]}]: {json.dumps(entry["message"], ensure_ascii=True)}')
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     action = parser.add_mutually_exclusive_group()
     action.add_argument('--apply', action='store_true')
     action.add_argument('--check', action='store_true')
+    action.add_argument('--dry-run', action='store_true', help='Preview normal --apply without writing files, authorization or service changes')
     action.add_argument('--protect-prompt', action='store_true', help='Install only the packaged password-window capture rule and reload Hyprland')
     action.add_argument('--install-agent-skills', action='store_true', help='Link only the packaged unlock instructions for installed AI clients; preserve conflicting skills')
     action.add_argument('--migrate-brand', action='store_true', help='Migrate the existing packaged widget, capture include and agent skills to KeyController; keep SSH/agent settings')
-    parser.add_argument('--json', action='store_true', help='Report --install-agent-skills results as JSON')
+    parser.add_argument('--scope', choices=('apply', 'agent-skills'), help='Action to preview; requires --dry-run (default: apply)')
+    parser.add_argument('--json', action='store_true', help='Report --dry-run or --install-agent-skills results as JSON')
     args = parser.parse_args()
-    if args.json and not args.install_agent_skills:
-        parser.error('--json is only supported with --install-agent-skills')
+    if args.json and not (args.install_agent_skills or args.dry_run):
+        parser.error('--json is only supported with --dry-run or --install-agent-skills')
+    if args.scope and not args.dry_run:
+        parser.error('--scope requires --dry-run')
     if os.geteuid() == 0:
         parser.error('Run as the desktop user, not root')
     home = Path.home()
     uid = os.getuid()
+    if args.dry_run:
+        result = preview_agent_skills(home) if args.scope == 'agent-skills' else setup_preview(home, uid)
+        report_setup_preview(result, args.json)
+        if not result['ready']:
+            raise SystemExit(1)
+        return
     if args.migrate_brand:
         migrate_brand(home)
         return
@@ -532,20 +791,14 @@ def main():
         report_agent_skills(agent_skills(home))
         print('Use --apply for the widget and agent configuration. The selected lockscreen is unchanged.')
         return
-    if not (SHARE / 'plugin/manifest.json').exists():
-        raise RuntimeError('Install the keycontroller system package first')
-    old_widget = home / '.config/omarchy/plugins' / LEGACY_PLUGIN_ID
-    if old_widget.exists() or old_widget.is_symlink():
-        raise RuntimeError('Existing SSH Keys widget retained. Run keycontroller-setup --migrate-brand before --apply')
-    ambiguous = [(p, n + 1) for p, _, es in configurations for n, v, c in es if v != socket and (c[0] == 'include' or (c == ('host', '*') and not p.is_relative_to(home / '.ssh')))]
-    if ambiguous:
-        raise RuntimeError(f'Conflicting IdentityAgent in shared or external includes requires review before setup: {ambiguous}')
+    setup_preconditions(home, socket, configurations)
     require_unlocked_session(uid)
-    shell_path = home / '.config/omarchy/shell.json'
-    shell_snapshot = shell_path.read_bytes()
+    shell_path, _, shell_snapshot = _brand_shell_snapshot(home)
     shell = json.loads(shell_snapshot)
     preflight_widget_link(home)
     prompt_plan = prompt_config_plan(home)
+    configuration_writes, retained = setup_config_plan(home, socket, configurations, shell)
+    configuration_snapshots = {path: setup_file_snapshot(path) for path, _, _ in configuration_writes}
     receipt_path = home / '.local/state/keycontroller/setup.json'
     receipt = {'schema_version': 1, 'uid': uid, 'complete': False}
     # Enablement alone does not imply complete desktop integration. Keep this
@@ -554,10 +807,17 @@ def main():
     backup = home / '.local/state/ssh-keys' / ('setup-' + time.strftime('%Y%m%d-%H%M%S') + f'-{time.time_ns()}')
     backup.mkdir(parents=True, mode=0o700)
     def write_config(path, text):
-        if path.exists():
+        original = configuration_snapshots[path]
+        if original is not None and original[1] is not None:
             dest = backup / str(path.relative_to(home))
             dest.parent.mkdir(parents=True, exist_ok=True)
-            shutil.copy2(path, dest)
+            # Use the original snapshot, even if an earlier write updated the
+            # target of this path's symlink. Never archive our intermediate edit.
+            with dest.open('xb') as stream:
+                os.fchmod(stream.fileno(), 0o600)
+                stream.write(original[1])
+                stream.flush()
+                os.fsync(stream.fileno())
         atomic(path, text)
     subprocess.run(['pkexec', '/usr/lib/ssh-keys/system-setup', 'enable', str(uid)], check=True)
     require_unlocked_session(uid)
@@ -565,47 +825,17 @@ def main():
         raise RuntimeError('Shell configuration changed during setup; stopped without replacing the widget or lockscreen. Run setup again after reviewing the change.')
     protect_prompt(home, backup, prompt_plan)
     link_widget(home, backup)
-    layout = shell.setdefault('bar', {}).setdefault('layout', {})
-    if not any(entry.get('id') == PLUGIN_ID
-               for section in ('left', 'center', 'right')
-               for entry in layout.get(section, [])):
-        layout.setdefault('right', []).insert(1, {'id': PLUGIN_ID})
-    # The selected lockscreen, its settings and enabled/disabled state belong
-    # to Omarchy/the user. KeyController never replaces a lock service.
-    disabled = set(shell.get('disabledPlugins', []))
-    disabled.discard(PLUGIN_ID)
-    shell['disabledPlugins'] = sorted(disabled)
     if shell_path.read_bytes() != shell_snapshot:
         raise RuntimeError('Shell configuration changed while installing the widget; the newer configuration was retained. No lockscreen was replaced.')
-    write_config(shell_path, json.dumps(shell, ensure_ascii=False, indent=2) + '\n')
-    for path, text, entries in configurations:
-        if not path.is_relative_to(home / '.ssh'):
-            print(f'Retained external SSH include: {path}')
-            continue
-        lines = text.splitlines(keepends=True)
-        changed = False
-        for number, value, context in entries:
-            if value != socket and context == ('host', '*'):
-                lines[number] = f'  IdentityAgent {socket}\n'
-                changed = True
-            elif value != socket:
-                print(f'Retained IdentityAgent exception: {path}:{number + 1}')
-        if changed:
-            write_config(path, ''.join(lines))
-    config = home / '.ssh/config'
-    text = config.read_text() if config.exists() else ''
-    write_config(config, managed(text, f'Host *\n  IdentityAgent {socket}'))
-    write_config(home / '.config/environment.d/90-ssh-keys.conf', f'SSH_AUTH_SOCK={socket}\n')
-    bashrc = home / '.bashrc'
-    if bashrc.exists():
-        write_config(bashrc, managed(bashrc.read_text(), f'export SSH_AUTH_SOCK={shlex.quote(socket)}'))
-    autostart = home / '.config/hypr/autostart.lua'
-    if autostart.exists():
-        text = autostart.read_text()
-        text = text.replace('hl.env("SSH_AUTH_SOCK", os.getenv("XDG_RUNTIME_DIR") .. "/ssh-agent.socket")', f'hl.env("SSH_AUTH_SOCK", "{socket}")')
-        if f'hl.env("SSH_AUTH_SOCK", "{socket}")' not in text:
-            text += f'\n-- SSH Keys managed agent\nhl.env("SSH_AUTH_SOCK", "{socket}")\n'
-        write_config(autostart, text)
+    for entry in retained:
+        print(f'Retained {entry["purpose"]}: {entry["path"]}')
+    # Validate the complete plan before writing: a config symlink and its
+    # Include target may refer to the same file that this plan will update.
+    for path, _, _ in configuration_writes:
+        if setup_file_snapshot(path) != configuration_snapshots[path]:
+            raise RuntimeError(f'Configuration changed during setup; newer content retained: {path}')
+    for path, text, _ in configuration_writes:
+        write_config(path, text)
     report_agent_skills(agent_skills(home, install=True))
     subprocess.run(['systemctl', '--user', 'set-environment', f'SSH_AUTH_SOCK={socket}'], check=True)
     reload_hyprland()
