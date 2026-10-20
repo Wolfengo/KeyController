@@ -1,5 +1,5 @@
 pkgname=keycontroller
-pkgver=0.1.4
+pkgver=0.1.5
 pkgrel=1
 pkgdesc='KeyController for Omarchy: SSH key widget, secure prompt and OpenSSH agent'
 url='https://github.com/Wolfengo/KeyController'
