@@ -1,0 +1,6 @@
+version: 2
+secret:
+  ignored_paths:
+    # GitGuardian incident 38002434 is a false positive: this file only mocks
+    # the Python stdlib pwd module (patch.object(setup.pwd, 'getpwuid', ...)).
+    - tests/system-setup.py
