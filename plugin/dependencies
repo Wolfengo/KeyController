@@ -22,7 +22,8 @@ case "$#:$1:${2-}" in
     1:--setup:) mode=setup ;;
     1:--wizard:) mode=wizard ;;
     1:--check:|2:--check:--json) mode=check ;;
-    *) echo 'Usage: dependencies --check --json | --install | --setup | --wizard' >&2; exit 2 ;;
+    1:--dry-run:|2:--dry-run:--json) mode=preview ;;
+    *) echo 'Usage: dependencies --check --json | --dry-run [--json] | --install | --setup | --wizard' >&2; exit 2 ;;
 esac
 
 if [ -x "$PYTHON" ]; then
@@ -221,8 +222,29 @@ else
     fi
 fi
 if [ "$state" != error ] && [ "$mode" != install ]; then check_helper; fi
-if valid_lock && ! (exec 9<"$lock"; "$FLOCK" -n 9) 2>/dev/null; then installing=true; fi
+if [ "$mode" != preview ] && valid_lock && ! (exec 9<"$lock"; "$FLOCK" -n 9) 2>/dev/null; then installing=true; fi
 if [ -n "$reason" ]; then reason_json="\"$reason\""; else reason_json=null; fi
+if [ "$mode" = preview ]; then
+    # Missing Python must never turn a preview into bootstrap installation.
+    # Only safe package metadata has been read; no lock/file is created.
+    operations='[]'
+    if [ "$state" != error ] && [ "$available" = true ] &&
+        { [ "$helper_missing" = false ] || [ "$helper_available" = true ]; }; then
+        operations="[{\"kind\":\"packages\",\"action\":\"install_python_bootstrap\",\"authority\":\"administrator\",\"command\":[\"/usr/bin/sudo\",\"/usr/bin/pacman\",\"-S\",\"--needed\",\"--\",\"$repository/python\"],\"condition\":\"Full wizard prerequisites must be rechecked before installation\"}]"
+    fi
+    if [ "${2-}" = --json ]; then
+        printf '{"schema_version":1,"mode":"dry-run","ready":false,"complete":false,"packages":%s,"operations":%s,"setup":{"state":"deferred"},"blockers":[{"code":"%s"}],"warnings":[{"code":"python_required","message":"Only bootstrap packages could be checked. Install Python explicitly, then rerun the preview. No changes were made."}]}\n' \
+            "$(emit)" "$operations" "$error_code"
+    else
+        printf 'KeyController: installation preview (read-only)\n'
+        printf 'Incomplete: Python is required to inspect all packages and configuration changes.\n'
+        printf 'No packages were installed and no setup was run.\n'
+        printf 'Bootstrap check: %s; Python repository: %s\n' "$error_code" "${repository:-unavailable}"
+        [ "$helper_missing" = false ] || printf 'KeyController package: %s\n' "${helper_reason:-available}"
+        printf 'Install Python explicitly, then rerun this preview.\n'
+    fi
+    exit 1
+fi
 if [ "$mode" = check ]; then
     emit
     [ "$state" != error ]

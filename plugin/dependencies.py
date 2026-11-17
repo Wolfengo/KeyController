@@ -14,6 +14,7 @@ import os
 from pathlib import Path
 import pwd
 import re
+import shlex
 import stat
 import subprocess
 import sys
@@ -576,6 +577,147 @@ def setup_wizard():
     return interactive_operation(wizard, hold_success=True)
 
 
+def installed_setup_preview(scope):
+    """Ask only the installed, root-owned program for its read-only plan."""
+    try:
+        metadata = Path(SETUP).lstat()
+        if (not stat.S_ISREG(metadata.st_mode) or metadata.st_uid != 0
+                or metadata.st_mode & 0o022):
+            raise DependencyError("setup_preview_unavailable")
+        result = subprocess.run(
+            [SETUP, "--dry-run", "--json", "--scope", scope],
+            env=user_setup_env(include_session=True), stdin=subprocess.DEVNULL,
+            capture_output=True, text=True, close_fds=True, timeout=30, check=False)
+    except (OSError, UnicodeError, subprocess.TimeoutExpired):
+        raise DependencyError("setup_preview_unavailable") from None
+    # Older installed packages reject the new flag. Do not fall back to --apply
+    # or execute the checkout's setup script to guess the installed behavior.
+    if result.returncode not in (0, 1):
+        raise DependencyError("setup_preview_unavailable")
+    if len(result.stdout) + len(result.stderr) > 256 * 1024:
+        raise DependencyError("setup_preview_invalid")
+    try:
+        plan = json.loads(result.stdout)
+    except ValueError:
+        raise DependencyError("setup_preview_invalid") from None
+    if (not isinstance(plan, dict) or type(plan.get("schema_version")) is not int
+            or plan["schema_version"] != 1 or plan.get("mode") != "dry-run"
+            or type(plan.get("ready")) is not bool
+            or any(not isinstance(plan.get(key), list)
+                   or any(not isinstance(item, dict) for item in plan[key])
+                   for key in ("operations", "blockers", "warnings"))
+            or (result.returncode == 0) != plan["ready"]
+            or (plan["ready"] and plan["blockers"])):
+        raise DependencyError("setup_preview_invalid")
+    return plan
+
+
+def wizard_preview():
+    """Describe the wizard without taking its lock or executing any step."""
+    status = check_dependencies(include_installing=False)
+    plan = {"schema_version": 1, "mode": "dry-run", "ready": False,
+            "complete": True, "packages": status, "operations": [],
+            "setup": None, "blockers": [], "warnings": []}
+    if status["state"] == "error":
+        plan["blockers"].append({"code": status["error_code"]})
+        plan["complete"] = False
+        return plan
+    if status["state"] == "missing":
+        if status["installable"]:
+            plan["operations"].append({
+                "kind": "packages", "action": "install", "authority": "administrator",
+                "command": [SUDO, PACMAN, "-S", "--needed", "--",
+                            *installation_targets(status)],
+                "condition": "Pacman confirmation; current signed repository metadata"})
+        else:
+            plan["blockers"].append({"code": "dependencies_not_installable"})
+        # Pacman's solver/confirmation remains authoritative for transitive
+        # dependencies. No -Sy/download is run to manufacture a future plan.
+        plan["warnings"].append({
+            "code": "package_transaction_pending",
+            "message": "Pacman will resolve transitive dependencies and confirm the full transaction."})
+        plan["complete"] = False
+        plan["setup"] = {"state": "deferred"}
+        plan["operations"].append({
+            "kind": "setup", "action": "recheck_then_configure",
+            "condition": "After packages are installed, recheck setup and migration requirements."})
+        plan["warnings"].append({
+            "code": "setup_preview_deferred",
+            "message": "Rerun this preview after package installation for exact configuration changes."})
+    else:
+        scope = "migrate-brand" if status["migration_required"] else (
+            "apply" if status["setup_required"] else "agent-skills")
+        if scope == "migrate-brand":
+            plan["complete"] = False
+            plan["setup"] = {"state": "deferred", "scope": scope}
+            plan["operations"].append({
+                "kind": "setup", "action": "migrate_brand",
+                "command": [SETUP, "--migrate-brand"],
+                "condition": "Existing managed legacy integration requires separate migration review."})
+            plan["warnings"].append({
+                "code": "migration_preview_unavailable",
+                "message": "Exact migration changes are not previewed. After migration, preview again; setup may still be required."})
+        elif scope == "apply" and legacy_widget_state() != "absent":
+            plan["blockers"].append({"code": "legacy_widget_conflict"})
+            plan["complete"] = False
+        else:
+            try:
+                setup = installed_setup_preview(scope)
+                plan["setup"] = {"state": "checked", "scope": scope, "plan": setup}
+                plan["blockers"].extend(setup["blockers"])
+                plan["warnings"].extend(setup["warnings"])
+                if scope == "apply":
+                    # --apply reports skill conflicts as warnings, but the
+                    # wizard's final skill-link step requires them resolved.
+                    skills = installed_setup_preview("agent-skills")
+                    plan["agent_instructions"] = skills
+                    plan["blockers"].extend(skills["blockers"])
+            except DependencyError as error:
+                plan["complete"] = False
+                plan["setup"] = {"state": "unavailable"}
+                plan["blockers"].append({"code": error.code})
+                plan["warnings"].append({
+                    "code": "compatible_setup_required",
+                    "message": "The installed system package must support this preview; no setup was run."})
+    plan["operations"].append({
+        "kind": "verification", "action": "verify_packages_setup_and_agent_instructions",
+        "condition": "After the preceding steps succeed"})
+    plan["warnings"].append({
+        "code": "snapshot_only",
+        "message": "This is a read-only snapshot, not authorization. Installation rechecks the current state."})
+    plan["ready"] = (plan["complete"] and not plan["blockers"]
+                     and bool(plan["setup"] and plan["setup"].get("plan", {}).get("ready"))
+                     and plan.get("agent_instructions", {}).get("ready", True))
+    return plan
+
+
+def report_preview(plan):
+    """Human output quotes untrusted path/control characters, never file data."""
+    def safe(value):
+        return json.dumps(str(value), ensure_ascii=True)[1:-1]
+
+    print("KeyController: installation preview (read-only)")
+    print("Ready to review." if plan["ready"] else "Incomplete or blocked; no changes made.")
+    for item in plan["packages"].get("missing", []):
+        print("  Package: " + json.dumps(item["requirement"], ensure_ascii=True)
+              + " [" + str(item["repository"] or "unavailable") + "]")
+    operations = list(plan["operations"])
+    setup = plan["setup"]
+    if setup and setup.get("plan"):
+        operations.extend(setup["plan"]["operations"])
+    for item in operations:
+        title = str(item.get("action", item.get("kind", "step"))).replace("_", " ")
+        print("  " + safe(title))
+        for field in ("path", "source", "command", "services", "authority", "purpose", "condition"):
+            if field in item:
+                value = shlex.join(item[field]) if field == "command" else item[field]
+                print("    " + field.capitalize() + ": " + safe(value))
+    for level in ("blockers", "warnings"):
+        for item in plan[level]:
+            print("  " + level[:-1].capitalize() + " [" + safe(item.get("code", "unknown")) + "]: "
+                  + safe(item.get("message", item.get("code", ""))))
+
+
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     mode = parser.add_mutually_exclusive_group(required=True)
@@ -583,8 +725,17 @@ def main(argv=None):
     mode.add_argument("--install", action="store_true")
     mode.add_argument("--setup", action="store_true")
     mode.add_argument("--wizard", action="store_true")
+    mode.add_argument("--dry-run", action="store_true",
+                      help="Preview the wizard without installing or changing configuration")
     parser.add_argument("--json", action="store_true")
     args = parser.parse_args(argv)
+    if args.dry_run:
+        plan = wizard_preview()
+        if args.json:
+            print(json.dumps(plan, ensure_ascii=True, indent=2))
+        else:
+            report_preview(plan)
+        return 0 if plan["ready"] else 1
     if args.install or args.setup or args.wizard:
         if args.json:
             parser.error("--install, --setup and --wizard require a visible terminal, not --json")

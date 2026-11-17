@@ -1,3 +1,4 @@
+from contextlib import ExitStack
 import importlib.machinery
 import importlib.util
 import io
@@ -808,6 +809,237 @@ class SetupTests(unittest.TestCase):
         with patch.object(setup.subprocess, 'run', side_effect=outputs) as run:
             setup.require_unlocked_session(1000)
             self.assertEqual(run.call_args_list[1].args[0], ['/usr/bin/loginctl', 'show-session', '1', '--property=User', '--property=Active', '--property=Remote', '--property=Type', '--property=LockedHint'])
+
+    def preview_fixture(self, directory):
+        home, share, package, target, _ = self.widget_fixture(directory)
+        shell = home / '.config/omarchy/shell.json'
+        shell.parent.mkdir(parents=True, exist_ok=True)
+        shell.write_text(json.dumps({'plugins': [{'id': 'omarchy.lock', 'private_test_setting': 'CANARY-CONFIG'}]}))
+        (home / '.ssh').mkdir()
+        (home / '.ssh/config').write_text('Host *\n Include nested.conf\nHost *\n IdentityAgent /old-agent\nHost secret-host\n IdentityAgent /explicit-secret-socket\n')
+        (home / '.ssh/nested.conf').write_text('Host *\n IdentityAgent /old-included-agent\n')
+        (home / '.ssh/id_ed25519').write_text('CANARY-PRIVATE-KEY-DO-NOT-READ')
+        (home / '.bashrc').write_text('# CANARY-BASHRC\n')
+        (home / '.config/hypr/autostart.lua').write_text('hl.env("SSH_AUTH_SOCK", os.getenv("XDG_RUNTIME_DIR") .. "/ssh-agent.socket")\n')
+        skill = share / 'skills/keycontroller'
+        skill.mkdir(parents=True)
+        (skill / 'SKILL.md').write_text('fixture packaged instructions')
+        (home / '.codex').mkdir()
+        return home, share, target
+
+    def unlocked_preview_command(self, command, **kwargs):
+        if command == ['/usr/bin/loginctl', 'show-user', str(setup.os.getuid()), '--property=Display', '--value']:
+            return SimpleNamespace(stdout='1\n', returncode=0)
+        if command[:3] == ['/usr/bin/loginctl', 'show-session', '1']:
+            return SimpleNamespace(stdout=f'User={setup.os.getuid()}\nActive=yes\nRemote=no\nType=wayland\nLockedHint=no\n', returncode=0)
+        if command == ['omarchy-shell', 'lock', 'status']:
+            return SimpleNamespace(stdout='{"locked":false,"requested":false,"secure":false}', returncode=0)
+        raise AssertionError(f'Dry-run attempted a mutation or unrelated process: {command}')
+
+    def filesystem_snapshot(self, home):
+        result = {}
+        for path in home.rglob('*'):
+            metadata = path.lstat()
+            content = setup.os.readlink(path) if path.is_symlink() else (path.read_bytes() if path.is_file() else None)
+            result[str(path.relative_to(home))] = (metadata.st_mode, metadata.st_ino, metadata.st_mtime_ns, content)
+        return result
+
+    def test_dry_run_json_never_writes_runs_mutations_or_reads_private_keys(self):
+        with tempfile.TemporaryDirectory() as directory:
+            home, share, _ = self.preview_fixture(directory)
+            before = self.filesystem_snapshot(home)
+            output = io.StringIO()
+            original_open, original_read = setup.os.open, setup.Path.read_text
+            original_io_open = io.open
+            def readonly_os_open(path, flags, *args, **kwargs):
+                self.assertFalse(flags & (setup.os.O_WRONLY | setup.os.O_RDWR | setup.os.O_CREAT | setup.os.O_TRUNC | setup.os.O_APPEND))
+                self.assertNotEqual(Path(path).name, 'id_ed25519')
+                return original_open(path, flags, *args, **kwargs)
+            def readonly_io_open(path, mode='r', *args, **kwargs):
+                self.assertFalse(any(value in mode for value in 'wax+'))
+                if not isinstance(path, int):
+                    self.assertNotEqual(Path(path).name, 'id_ed25519')
+                return original_io_open(path, mode, *args, **kwargs)
+            def readonly_text(path, *args, **kwargs):
+                self.assertNotEqual(path.name, 'id_ed25519')
+                return original_read(path, *args, **kwargs)
+            with ExitStack() as stack:
+                stack.enter_context(patch('sys.argv', ['keycontroller-setup', '--dry-run', '--json']))
+                stack.enter_context(patch.object(setup.Path, 'home', return_value=home))
+                stack.enter_context(patch.object(setup, 'SHARE', share))
+                stack.enter_context(patch.object(setup.os, 'geteuid', return_value=1000))
+                stack.enter_context(patch.object(setup.subprocess, 'run', side_effect=self.unlocked_preview_command))
+                stack.enter_context(patch.object(setup.os, 'open', side_effect=readonly_os_open))
+                stack.enter_context(patch.object(setup.Path, 'read_text', readonly_text))
+                stack.enter_context(patch('io.open', side_effect=readonly_io_open))
+                stack.enter_context(patch('sys.stdout', output))
+                for name in ('mkdir', 'symlink', 'unlink', 'rename', 'replace', 'chmod'):
+                    stack.enter_context(patch.object(setup.os, name, side_effect=AssertionError('read-only preview')))
+                for name in ('atomic', 'protect_prompt', 'link_widget', 'reload_hyprland'):
+                    stack.enter_context(patch.object(setup, name, side_effect=AssertionError('read-only preview')))
+                setup.main()
+            result = json.loads(output.getvalue())
+            self.assertEqual((result['schema_version'], result['mode'], result['scope']), (1, 'dry-run', 'apply'))
+            self.assertTrue(result['ready'], result['blockers'])
+            self.assertEqual(self.filesystem_snapshot(home), before)
+            for secret in ('CANARY-', 'secret-host', '/explicit-secret-socket', '/old-included-agent'):
+                self.assertNotIn(secret, output.getvalue())
+            commands = [entry['command'] for entry in result['operations'] if 'command' in entry]
+            self.assertIn(['pkexec', '/usr/lib/ssh-keys/system-setup', 'enable', str(setup.os.getuid())], commands)
+            self.assertIn(['/usr/bin/systemctl', 'enable', '--now', f'ssh-keysd@{setup.os.getuid()}.service'], commands)
+            self.assertIn(['hyprctl', 'reload'], commands)
+
+    def test_dry_run_file_and_symlink_inventory_matches_apply_on_disposable_home(self):
+        with tempfile.TemporaryDirectory() as directory:
+            home, share, _ = self.preview_fixture(directory)
+            with patch.object(setup, 'SHARE', share), patch.object(setup, 'require_unlocked_session'):
+                preview = setup.setup_preview(home, setup.os.getuid())
+                original_config = (home / '.ssh/config').read_bytes()
+                configs = setup.ssh_configs(home)
+                shell = json.loads((home / '.config/omarchy/shell.json').read_text())
+                writes, _ = setup.setup_config_plan(home, f'/run/ssh-keys/{setup.os.getuid()}/agent.sock', configs, shell)
+                expected = {str(path): text for path, text, _ in writes}
+                with patch('sys.argv', ['keycontroller-setup', '--apply']), patch.object(setup.Path, 'home', return_value=home), patch.object(setup.os, 'geteuid', return_value=1000), patch.object(setup.subprocess, 'run', return_value=SimpleNamespace(stdout='', returncode=0)), patch('sys.stdout', io.StringIO()):
+                    setup.main()
+            self.assertTrue(preview['ready'])
+            changed = {entry['path'] for entry in preview['operations'] if entry['kind'] == 'file' and entry['action'] in ('create', 'replace', 'update')}
+            self.assertEqual(changed, set(expected) | {str(home / '.config/hypr/hyprland.lua'), str(home / '.local/state/keycontroller/setup.json')})
+            for path, text in expected.items():
+                self.assertEqual(Path(path).read_text(), text)
+            for entry in preview['operations']:
+                if entry['kind'] == 'symlink' and entry['action'] == 'create':
+                    self.assertTrue(Path(entry['path']).is_symlink())
+                    self.assertEqual(Path(entry['path']).resolve(), Path(entry['source']).resolve())
+            backups = list((home / '.local/state/ssh-keys').glob('setup-*/.ssh/config'))
+            self.assertEqual(len(backups), 1)
+            self.assertEqual(backups[0].read_bytes(), original_config)
+            self.assertIn('IdentityAgent /explicit-secret-socket', (home / '.ssh/config').read_text())
+
+    def test_dry_run_reports_blockers_without_mutation_and_keeps_json_valid(self):
+        for fault in ('legacy-widget', 'ambiguous-include', 'invalid-shell', 'locked', 'file-parent'):
+            with self.subTest(fault=fault), tempfile.TemporaryDirectory() as directory:
+                home, share, target = self.preview_fixture(directory)
+                session_error = None
+                if fault == 'legacy-widget':
+                    old = target.with_name(setup.LEGACY_PLUGIN_ID)
+                    old.parent.mkdir(parents=True)
+                    old.symlink_to(setup.LEGACY_SHARE / 'plugin')
+                elif fault == 'ambiguous-include':
+                    (home / '.ssh/config').write_text('Host custom\n Include nested.conf\nHost *\n Include nested.conf\n')
+                elif fault == 'invalid-shell':
+                    (home / '.config/omarchy/shell.json').write_text('{"private-secret":invalid}')
+                elif fault == 'locked':
+                    session_error = RuntimeError('Unlock the active local Wayland session before changing KeyController integration')
+                elif fault == 'file-parent':
+                    (home / '.config/environment.d').write_text('existing file')
+                before = self.filesystem_snapshot(home)
+                output = io.StringIO()
+                with patch('sys.argv', ['keycontroller-setup', '--dry-run', '--json']), patch.object(setup.Path, 'home', return_value=home), patch.object(setup, 'SHARE', share), patch.object(setup.os, 'geteuid', return_value=1000), patch.object(setup, 'require_unlocked_session', side_effect=session_error), patch.object(setup.subprocess, 'run', side_effect=AssertionError('no mutation commands')), patch('sys.stdout', output):
+                    with self.assertRaises(SystemExit) as stopped:
+                        setup.main()
+                result = json.loads(output.getvalue())
+                self.assertEqual(stopped.exception.code, 1)
+                self.assertFalse(result['ready'])
+                self.assertTrue(result['blockers'])
+                self.assertNotIn('private-secret', output.getvalue())
+                self.assertEqual(self.filesystem_snapshot(home), before)
+
+    def test_agent_skill_preview_scope_does_not_inspect_ssh_desktop_or_services(self):
+        with tempfile.TemporaryDirectory() as directory:
+            home, share, _ = self.skill_fixture(directory)
+            (home / '.codex').mkdir()
+            output = io.StringIO()
+            with patch('sys.argv', ['keycontroller-setup', '--dry-run', '--scope', 'agent-skills', '--json']), patch.object(setup.Path, 'home', return_value=home), patch.object(setup, 'SHARE', share), patch.object(setup.os, 'geteuid', return_value=1000), patch.object(setup, 'ssh_configs', side_effect=AssertionError('skills only')), patch.object(setup, 'require_unlocked_session', side_effect=AssertionError('skills only')), patch.object(setup.subprocess, 'run', side_effect=AssertionError('skills only')), patch('sys.stdout', output):
+                setup.main()
+            result = json.loads(output.getvalue())
+            self.assertTrue(result['ready'])
+            self.assertEqual(result['scope'], 'agent-skills')
+            self.assertEqual(len(result['operations']), 1)
+            self.assertEqual(result['operations'][0]['path'], str(home / '.codex/skills/keycontroller'))
+            self.assertFalse((home / '.codex/skills').exists())
+            self.assertFalse((home / '.local').exists())
+
+    def test_dry_run_cannot_be_combined_with_mutation_flags(self):
+        for arguments in (['--dry-run', '--apply'], ['--dry-run', '--migrate-brand'], ['--dry-run', '--protect-prompt'], ['--dry-run', '--install-agent-skills'], ['--scope', 'agent-skills', '--apply']):
+            with self.subTest(arguments=arguments), patch('sys.argv', ['keycontroller-setup', *arguments]), patch('sys.stderr', io.StringIO()), patch.object(setup.subprocess, 'run', side_effect=AssertionError('parser must refuse before running anything')):
+                with self.assertRaises(SystemExit) as stopped:
+                    setup.main()
+                self.assertEqual(stopped.exception.code, 2)
+
+    def test_apply_preserves_config_edited_while_awaiting_system_authorization(self):
+        with tempfile.TemporaryDirectory() as directory:
+            home, share, _ = self.preview_fixture(directory)
+            bashrc = home / '.bashrc'
+            changed = '# changed while the authorization dialog was open\n'
+            def run(command, **kwargs):
+                self.assertEqual(command[0], 'pkexec')
+                bashrc.write_text(changed)
+                return SimpleNamespace(stdout='', returncode=0)
+            with patch('sys.argv', ['keycontroller-setup', '--apply']), patch.object(setup.Path, 'home', return_value=home), patch.object(setup, 'SHARE', share), patch.object(setup.os, 'geteuid', return_value=1000), patch.object(setup, 'require_unlocked_session'), patch.object(setup.subprocess, 'run', side_effect=run), patch('sys.stdout', io.StringIO()):
+                with self.assertRaisesRegex(RuntimeError, 'Configuration changed during setup'):
+                    setup.main()
+            self.assertEqual(bashrc.read_text(), changed)
+            self.assertFalse(json.loads((home / '.local/state/keycontroller/setup.json').read_text())['complete'])
+
+    def test_shared_plan_preserves_existing_primary_ssh_symlink_apply_semantics(self):
+        with tempfile.TemporaryDirectory() as directory:
+            home, share, _ = self.preview_fixture(directory)
+            config = home / '.ssh/config'
+            physical = home / '.ssh/primary.conf'
+            config.rename(physical)
+            config.symlink_to(physical)
+            original = physical.read_bytes()
+            with patch.object(setup, 'SHARE', share), patch.object(setup, 'require_unlocked_session'):
+                preview = setup.setup_preview(home, setup.os.getuid())
+                with patch('sys.argv', ['keycontroller-setup', '--apply']), patch.object(setup.Path, 'home', return_value=home), patch.object(setup.os, 'geteuid', return_value=1000), patch.object(setup.subprocess, 'run', return_value=SimpleNamespace(stdout='', returncode=0)), patch('sys.stdout', io.StringIO()):
+                    setup.main()
+            self.assertTrue(preview['ready'])
+            self.assertIn('configuration_symlink', [entry['code'] for entry in preview['warnings']])
+            self.assertFalse(config.is_symlink())
+            socket = f'/run/ssh-keys/{setup.os.getuid()}/agent.sock'
+            for path in (config, physical):
+                self.assertIn('IdentityAgent ' + socket, path.read_text())
+                self.assertIn('IdentityAgent /explicit-secret-socket', path.read_text())
+            self.assertIn(setup.BEGIN, config.read_text())
+            self.assertNotIn(setup.BEGIN, physical.read_text())
+            backup = next((home / '.local/state/ssh-keys').glob('setup-*'))
+            for name in ('config', 'primary.conf'):
+                archive = backup / '.ssh' / name
+                self.assertEqual(archive.read_bytes(), original)
+                self.assertEqual(archive.stat().st_mode & 0o777, 0o600)
+
+    def test_human_preview_escapes_terminal_controls_in_paths_and_errors(self):
+        with tempfile.TemporaryDirectory() as directory:
+            home, share, _ = self.preview_fixture(Path(directory) / 'control-\x1b[2J\nFORGED')
+            output = io.StringIO()
+            with patch.object(setup, 'SHARE', share), patch.object(setup, 'require_unlocked_session', side_effect=RuntimeError('blocked\x1b[2J\nFORGED')):
+                preview = setup.setup_preview(home, setup.os.getuid())
+            with patch('sys.stdout', output):
+                setup.report_setup_preview(preview)
+            rendered = output.getvalue()
+            self.assertNotIn('\x1b', rendered)
+            self.assertNotIn('\nFORGED', rendered)
+            self.assertIn('\\u001b[2J\\nFORGED', rendered)
+            self.assertTrue(preview['blockers'])
+            self.assertTrue(all(ord(character) >= 32 or character == '\n' for character in rendered))
+
+    def test_external_primary_ssh_symlink_remains_blocked_when_it_needs_rewrite(self):
+        with tempfile.TemporaryDirectory() as directory:
+            home, share, _ = self.preview_fixture(directory)
+            config = home / '.ssh/config'
+            external = home / 'external-ssh.conf'
+            config.rename(external)
+            config.symlink_to(external)
+            before = external.read_bytes()
+            with patch.object(setup, 'SHARE', share), patch.object(setup, 'require_unlocked_session'):
+                preview = setup.setup_preview(home, setup.os.getuid())
+                with patch('sys.argv', ['keycontroller-setup', '--apply']), patch.object(setup.Path, 'home', return_value=home), patch.object(setup.os, 'geteuid', return_value=1000), patch.object(setup.subprocess, 'run', side_effect=AssertionError('external wildcard must block before authorization')), patch('sys.stdout', io.StringIO()):
+                    with self.assertRaisesRegex(RuntimeError, 'Conflicting IdentityAgent'):
+                        setup.main()
+            self.assertFalse(preview['ready'])
+            self.assertEqual(external.read_bytes(), before)
+            self.assertTrue(config.is_symlink())
+            self.assertFalse((home / '.local').exists())
 
     def test_root_setup_enables_only_the_requested_user_helper(self):
         with tempfile.TemporaryDirectory() as directory:
